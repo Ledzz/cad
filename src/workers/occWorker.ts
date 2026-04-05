@@ -1,0 +1,215 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import * as Comlink from 'comlink'
+import type { OpenCascadeInstance, TopoDSShape } from '../engine/occTypes'
+import type { TessellationData, FaceRange } from '../engine/tessellation'
+
+let oc: OpenCascadeInstance | null = null
+
+/**
+ * Tessellate an OCCT TopoDS_Shape into flat arrays suitable for Three.js BufferGeometry.
+ */
+function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1, angularDeflection = 0.5): TessellationData {
+  if (!oc) throw new Error('OpenCascade not initialized')
+
+  // Run incremental mesh on the shape
+  const mesh = new oc.BRepMesh_IncrementalMesh_2(shape, linearDeflection, false, angularDeflection, false)
+  if (!mesh.IsDone()) {
+    mesh.delete()
+    throw new Error('Tessellation failed')
+  }
+
+  const allVertices: number[] = []
+  const allNormals: number[] = []
+  const allIndices: number[] = []
+  const faceRanges: FaceRange[] = []
+
+  let vertexOffset = 0
+  let faceIndex = 0
+
+  // Iterate over all faces in the shape
+  const explorer = new oc.TopExp_Explorer_2(shape, oc.TopAbs_ShapeEnum.TopAbs_FACE, oc.TopAbs_ShapeEnum.TopAbs_SHAPE)
+
+  while (explorer.More()) {
+    const face = oc.TopoDS.Face_1(explorer.Current())
+    const location = new oc.TopLoc_Location_1()
+    const triangulationHandle = oc.BRep_Tool.Triangulation(face, location)
+
+    if (triangulationHandle && !triangulationHandle.IsNull()) {
+      const triangulation = triangulationHandle.get()
+      const nbTriangles = triangulation.NbTriangles()
+      const nbNodes = triangulation.NbNodes()
+
+      const startIndex = allIndices.length
+
+      // Check if face is reversed — need to flip normals and winding
+      const isReversed = face.Orientation_1() === oc.TopAbs_Orientation.TopAbs_REVERSED
+
+      // Get the transformation for this face
+      const trsf = location.Transformation()
+
+      // Extract rotation part of the transformation (upper-left 3x3)
+      const r11 = trsf.Value(1, 1), r12 = trsf.Value(1, 2), r13 = trsf.Value(1, 3)
+      const r21 = trsf.Value(2, 1), r22 = trsf.Value(2, 2), r23 = trsf.Value(2, 3)
+      const r31 = trsf.Value(3, 1), r32 = trsf.Value(3, 2), r33 = trsf.Value(3, 3)
+      const t1 = trsf.Value(1, 4), t2 = trsf.Value(2, 4), t3 = trsf.Value(3, 4)
+
+      const hasNormals = triangulation.HasNormals()
+
+      // Extract vertices and normals
+      for (let i = 1; i <= nbNodes; i++) {
+        const node = triangulation.Node(i)
+        const x = node.X(), y = node.Y(), z = node.Z()
+
+        // Transform position
+        allVertices.push(
+          r11 * x + r12 * y + r13 * z + t1,
+          r21 * x + r22 * y + r23 * z + t2,
+          r31 * x + r32 * y + r33 * z + t3,
+        )
+
+        // Use OCCT-provided normals if available
+        if (hasNormals) {
+          const normal = triangulation.Normal(i)
+          let nx = normal.X(), ny = normal.Y(), nz = normal.Z()
+
+          // Flip normal for reversed faces
+          if (isReversed) { nx = -nx; ny = -ny; nz = -nz }
+
+          // Transform normal by rotation only (no translation)
+          const tnx = r11 * nx + r12 * ny + r13 * nz
+          const tny = r21 * nx + r22 * ny + r23 * nz
+          const tnz = r31 * nx + r32 * ny + r33 * nz
+
+          allNormals.push(tnx, tny, tnz)
+        } else {
+          // Placeholder — will compute from triangles below
+          allNormals.push(0, 0, 0)
+        }
+      }
+
+      // Extract triangle indices, respecting face orientation
+      for (let i = 1; i <= nbTriangles; i++) {
+        const tri = triangulation.Triangle(i)
+        const n1 = tri.Value(1) - 1 + vertexOffset
+        const n2 = tri.Value(2) - 1 + vertexOffset
+        const n3 = tri.Value(3) - 1 + vertexOffset
+        if (isReversed) {
+          allIndices.push(n1, n3, n2) // swap winding
+        } else {
+          allIndices.push(n1, n2, n3)
+        }
+      }
+
+      // Fallback: compute normals from cross product if OCCT didn't provide them
+      if (!hasNormals) {
+        for (let i = 1; i <= nbTriangles; i++) {
+          const tri = triangulation.Triangle(i)
+          let i1 = tri.Value(1) - 1 + vertexOffset
+          let i2 = tri.Value(2) - 1 + vertexOffset
+          let i3 = tri.Value(3) - 1 + vertexOffset
+          if (isReversed) { const tmp = i2; i2 = i3; i3 = tmp }
+
+          const ax = allVertices[i2 * 3] - allVertices[i1 * 3]
+          const ay = allVertices[i2 * 3 + 1] - allVertices[i1 * 3 + 1]
+          const az = allVertices[i2 * 3 + 2] - allVertices[i1 * 3 + 2]
+          const bx = allVertices[i3 * 3] - allVertices[i1 * 3]
+          const by = allVertices[i3 * 3 + 1] - allVertices[i1 * 3 + 1]
+          const bz = allVertices[i3 * 3 + 2] - allVertices[i1 * 3 + 2]
+
+          const nx = ay * bz - az * by
+          const ny = az * bx - ax * bz
+          const nz = ax * by - ay * bx
+
+          for (const idx of [i1, i2, i3]) {
+            allNormals[idx * 3] += nx
+            allNormals[idx * 3 + 1] += ny
+            allNormals[idx * 3 + 2] += nz
+          }
+        }
+      }
+
+      const count = nbTriangles * 3
+      faceRanges.push({ faceIndex, startIndex, count })
+
+      vertexOffset += nbNodes
+    }
+
+    location.delete()
+    faceIndex++
+    explorer.Next()
+  }
+
+  explorer.delete()
+  mesh.delete()
+
+  // Normalize all normals
+  for (let i = 0; i < allNormals.length; i += 3) {
+    const nx = allNormals[i]
+    const ny = allNormals[i + 1]
+    const nz = allNormals[i + 2]
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz)
+    if (len > 0) {
+      allNormals[i] /= len
+      allNormals[i + 1] /= len
+      allNormals[i + 2] /= len
+    }
+  }
+
+  return {
+    id,
+    vertices: new Float32Array(allVertices),
+    normals: new Float32Array(allNormals),
+    indices: new Uint32Array(allIndices),
+    faceRanges,
+  }
+}
+
+/**
+ * The API exposed via Comlink from this Web Worker.
+ */
+const occWorkerApi = {
+  async init(): Promise<boolean> {
+    try {
+      // Dynamic import to load the WASM module
+      const occModule = await import('opencascade.js')
+      const initFn = occModule.default || occModule.initOpenCascade
+      oc = await initFn() as OpenCascadeInstance
+      console.log('[OCC Worker] OpenCascade initialized successfully')
+      return true
+    } catch (err) {
+      console.error('[OCC Worker] Failed to initialize OpenCascade:', err)
+      throw err
+    }
+  },
+
+  makeBox(id: string, dx: number, dy: number, dz: number): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+    const builder = new oc.BRepPrimAPI_MakeBox_1(dx, dy, dz)
+    const shape = builder.Shape()
+    const result = tessellateShape(shape, id)
+    builder.delete()
+    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+
+  makeCylinder(id: string, radius: number, height: number): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+    const builder = new oc.BRepPrimAPI_MakeCylinder_1(radius, height)
+    const shape = builder.Shape()
+    const result = tessellateShape(shape, id)
+    builder.delete()
+    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+
+  makeSphere(id: string, radius: number): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+    const builder = new oc.BRepPrimAPI_MakeSphere_1(radius)
+    const shape = builder.Shape()
+    const result = tessellateShape(shape, id)
+    builder.delete()
+    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+}
+
+export type OccWorkerApi = typeof occWorkerApi
+
+Comlink.expose(occWorkerApi)
