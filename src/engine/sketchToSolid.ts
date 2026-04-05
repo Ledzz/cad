@@ -29,11 +29,122 @@ function sketchTo3D(
   ]
 }
 
+// ─── Edge Grouping ──────────────────────────────────────────
+
+const EPSILON = 1e-6
+
 /**
- * Extract OCC edge definitions from a sketch's entities.
- * Only processes lines, arcs, and circles (not standalone points).
+ * Get the start and end 3D points of an edge definition.
+ * For circles (self-closed), returns null — they are always their own group.
  */
-export function sketchToEdges(sketch: SketchState): OccEdgeDef[] {
+function getEdgeEndpoints(edge: OccEdgeDef): { start: number[]; end: number[] } | null {
+  switch (edge.type) {
+    case 'line':
+      return { start: edge.points[0], end: edge.points[1] }
+    case 'arc':
+      // arc points: [start, mid, end]
+      return { start: edge.points[0], end: edge.points[2] }
+    case 'circle':
+      // circles are self-closed, no shared endpoints
+      return null
+  }
+}
+
+/**
+ * Check if two 3D points are the same within epsilon.
+ */
+function pointsEqual(a: number[], b: number[]): boolean {
+  return (
+    Math.abs(a[0] - b[0]) < EPSILON &&
+    Math.abs(a[1] - b[1]) < EPSILON &&
+    Math.abs(a[2] - b[2]) < EPSILON
+  )
+}
+
+/**
+ * Group a flat list of edges into connected loops.
+ *
+ * Two edges are connected if they share an endpoint (start or end).
+ * Circles are always their own group (self-closed curves).
+ * Uses union-find for efficient connected component detection.
+ */
+export function groupEdgesIntoLoops(edges: OccEdgeDef[]): OccEdgeDef[][] {
+  if (edges.length === 0) return []
+  if (edges.length === 1) return [edges]
+
+  const n = edges.length
+  // Union-find
+  const parent = Array.from({ length: n }, (_, i) => i)
+  const rank = new Array(n).fill(0)
+
+  function find(x: number): number {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]] // path compression
+      x = parent[x]
+    }
+    return x
+  }
+
+  function union(a: number, b: number): void {
+    const ra = find(a)
+    const rb = find(b)
+    if (ra === rb) return
+    if (rank[ra] < rank[rb]) {
+      parent[ra] = rb
+    } else if (rank[ra] > rank[rb]) {
+      parent[rb] = ra
+    } else {
+      parent[rb] = ra
+      rank[ra]++
+    }
+  }
+
+  // Collect endpoints for non-circle edges
+  const endpoints: Array<{ start: number[]; end: number[] } | null> = edges.map(getEdgeEndpoints)
+
+  // For each pair of non-circle edges, check if they share an endpoint
+  for (let i = 0; i < n; i++) {
+    const epI = endpoints[i]
+    if (!epI) continue // circle — skip
+
+    for (let j = i + 1; j < n; j++) {
+      const epJ = endpoints[j]
+      if (!epJ) continue // circle — skip
+
+      if (
+        pointsEqual(epI.start, epJ.start) ||
+        pointsEqual(epI.start, epJ.end) ||
+        pointsEqual(epI.end, epJ.start) ||
+        pointsEqual(epI.end, epJ.end)
+      ) {
+        union(i, j)
+      }
+    }
+  }
+
+  // Group edges by their root
+  const groups = new Map<number, OccEdgeDef[]>()
+  for (let i = 0; i < n; i++) {
+    const root = find(i)
+    if (!groups.has(root)) {
+      groups.set(root, [])
+    }
+    groups.get(root)!.push(edges[i])
+  }
+
+  return Array.from(groups.values())
+}
+
+// ─── Main Edge Extraction ───────────────────────────────────
+
+/**
+ * Extract OCC edge definitions from a sketch's entities, grouped into
+ * separate connected loops. Each loop can be independently extruded.
+ *
+ * Only processes lines, arcs, and circles (not standalone points).
+ * Circles are always their own loop (self-closed curves).
+ */
+export function sketchToEdgeGroups(sketch: SketchState): OccEdgeDef[][] {
   const { entities, plane } = sketch
   const edges: OccEdgeDef[] = []
   const points = new Map<string, SketchPoint>()
@@ -102,7 +213,15 @@ export function sketchToEdges(sketch: SketchState): OccEdgeDef[] {
     }
   }
 
-  return edges
+  return groupEdgesIntoLoops(edges)
+}
+
+/**
+ * @deprecated Use sketchToEdgeGroups instead. This returns a flat list
+ * which fails when the sketch has multiple disconnected profiles.
+ */
+export function sketchToEdges(sketch: SketchState): OccEdgeDef[] {
+  return sketchToEdgeGroups(sketch).flat()
 }
 
 /**
@@ -114,15 +233,15 @@ export async function extrudeCurrentSketch(
   distance: number,
   id: string
 ): Promise<THREE.BufferGeometry> {
-  const edges = sketchToEdges(sketch)
-  if (edges.length === 0) {
+  const edgeGroups = sketchToEdgeGroups(sketch)
+  if (edgeGroups.length === 0) {
     throw new Error('No sketch edges to extrude')
   }
 
   const api = await getOccApi()
   const tessData = await api.extrudeSketch(
     id,
-    edges,
+    edgeGroups,
     sketch.plane.normal as [number, number, number],
     distance
   )

@@ -9,7 +9,7 @@
 import * as THREE from 'three'
 import type { Feature, SketchFeature, ExtrudeFeature } from './featureTypes'
 import type { TessellationData } from './tessellation'
-import { sketchToEdges, type OccEdgeDef } from './sketchToSolid'
+import { sketchToEdgeGroups, type OccEdgeDef } from './sketchToSolid'
 import type { SketchState } from './sketchTypes'
 import { getOccApi } from '../workers/occApi'
 
@@ -85,10 +85,10 @@ async function buildExtrude(
     )
   }
 
-  // Convert sketch snapshot to edge definitions
+  // Convert sketch snapshot to edge definitions (grouped by connected loops)
   const sketchState = snapshotToSketchState(sketchFeature)
-  const edges: OccEdgeDef[] = sketchToEdges(sketchState)
-  if (edges.length === 0) {
+  const edgeGroups: OccEdgeDef[][] = sketchToEdgeGroups(sketchState)
+  if (edgeGroups.length === 0 || edgeGroups.every((g) => g.length === 0)) {
     throw new Error(`Sketch "${feature.sketchId}" has no edges to extrude`)
   }
 
@@ -119,7 +119,7 @@ async function buildExtrude(
   }
 
   const api = await getOccApi()
-  const tess = await api.extrudeSketch(feature.id, edges, direction, distance)
+  const tess = await api.extrudeSketch(feature.id, edgeGroups, direction, distance)
   return tessToGeometry(tess)
 }
 

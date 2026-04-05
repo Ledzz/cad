@@ -14,18 +14,27 @@ const buttonIdle =
   `${buttonBase} text-gray-400 hover:text-gray-200 hover:bg-[#2a2a4a]`
 const buttonActive =
   `${buttonBase} text-white bg-blue-600 hover:bg-blue-500`
+const buttonDisabled =
+  `${buttonBase} text-gray-600 cursor-not-allowed`
 
 export function Toolbar() {
   const mode = useAppStore((s) => s.mode)
   const activeSketch = useAppStore((s) => s.activeSketch)
+  const editingSketchFeatureId = useAppStore((s) => s.editingSketchFeatureId)
   const enterSketchMode = useAppStore((s) => s.enterSketchMode)
   const exitSketchMode = useAppStore((s) => s.exitSketchMode)
+  const confirmSketchEdit = useAppStore((s) => s.confirmSketchEdit)
   const setActiveSketchTool = useAppStore((s) => s.setActiveSketchTool)
   const addFeatures = useAppStore((s) => s.addFeatures)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
+  const undo = useAppStore((s) => s.undo)
+  const redo = useAppStore((s) => s.redo)
+  const canUndo = useAppStore((s) => s.canUndo)
+  const canRedo = useAppStore((s) => s.canRedo)
   const [extruding, setExtruding] = useState(false)
 
   const activeTool = activeSketch?.activeTool ?? null
+  const isEditingExisting = editingSketchFeatureId !== null
 
   const handleFinishAndExtrude = async () => {
     if (!activeSketch) return
@@ -48,37 +57,62 @@ export function Toolbar() {
 
     setExtruding(true)
     try {
-      // Create a SketchFeature (snapshot of current sketch)
-      const sketchId = generateFeatureId('sketch')
-      const sketchFeature: SketchFeature = {
-        id: sketchId,
-        name: `Sketch (${activeSketch.plane.name})`,
-        type: 'sketch',
-        suppressed: false,
-        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+      if (isEditingExisting) {
+        // Updating existing sketch + keeping/creating extrude
+        // First save the sketch edits
+        const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities)
+        const { updateFeature } = useAppStore.getState()
+        await updateFeature(editingSketchFeatureId, { sketch: snapshot } as Partial<SketchFeature>)
+
+        exitSketchMode()
+      } else {
+        // Create a SketchFeature (snapshot of current sketch)
+        const sketchId = generateFeatureId('sketch')
+        const sketchFeature: SketchFeature = {
+          id: sketchId,
+          name: `Sketch (${activeSketch.plane.name})`,
+          type: 'sketch',
+          suppressed: false,
+          sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+        }
+
+        // Create an ExtrudeFeature referencing the sketch
+        const extrudeId = generateFeatureId('extrude')
+        const extrudeFeature: ExtrudeFeature = {
+          id: extrudeId,
+          name: `Extrude (${Math.abs(distance)}mm)`,
+          type: 'extrude',
+          suppressed: false,
+          sketchId,
+          distance: Math.abs(distance),
+          direction: distance > 0 ? 'normal' : 'reverse',
+        }
+
+        // Add both features and rebuild
+        await addFeatures([sketchFeature, extrudeFeature])
+        exitSketchMode()
       }
-
-      // Create an ExtrudeFeature referencing the sketch
-      const extrudeId = generateFeatureId('extrude')
-      const extrudeFeature: ExtrudeFeature = {
-        id: extrudeId,
-        name: `Extrude (${Math.abs(distance)}mm)`,
-        type: 'extrude',
-        suppressed: false,
-        sketchId,
-        distance: Math.abs(distance),
-        direction: distance > 0 ? 'normal' : 'reverse',
-      }
-
-      // Add both features and rebuild
-      await addFeatures([sketchFeature, extrudeFeature])
-
-      exitSketchMode()
     } catch (err) {
       console.error('[Toolbar] Extrude failed:', err)
       alert(`Extrude failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
     } finally {
       setExtruding(false)
+    }
+  }
+
+  const handleFinishSketch = async () => {
+    if (isEditingExisting) {
+      // Update the existing sketch feature
+      await confirmSketchEdit()
+    } else {
+      // Save as a new sketch feature
+      if (!activeSketch) return
+      const hasEntities = activeSketch.entities.size > 0
+      if (hasEntities) {
+        await confirmSketchEdit()
+      } else {
+        exitSketchMode()
+      }
     }
   }
 
@@ -91,6 +125,26 @@ export function Toolbar() {
 
       {mode === 'modeling' ? (
         <>
+          {/* Undo / Redo */}
+          <button
+            className={canUndo() ? buttonIdle : buttonDisabled}
+            onClick={() => undo()}
+            disabled={!canUndo() || isBusy}
+            title="Undo (Ctrl+Z)"
+          >
+            Undo
+          </button>
+          <button
+            className={canRedo() ? buttonIdle : buttonDisabled}
+            onClick={() => redo()}
+            disabled={!canRedo() || isBusy}
+            title="Redo (Ctrl+Shift+Z)"
+          >
+            Redo
+          </button>
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
           {/* Sketch plane selection */}
           <span className="text-xs text-gray-500 mr-1">Sketch on:</span>
           {Object.entries(SKETCH_PLANES).map(([name, plane]) => (
@@ -113,7 +167,7 @@ export function Toolbar() {
         <>
           {/* Sketch tools */}
           <span className="text-xs text-gray-500 mr-1">
-            Sketch ({activeSketch?.plane.name})
+            {isEditingExisting ? 'Editing' : 'Sketch'} ({activeSketch?.plane.name})
           </span>
           <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
 
@@ -159,9 +213,10 @@ export function Toolbar() {
           </button>
           <button
             className={`${buttonBase} text-green-400 hover:text-green-300 hover:bg-green-900/30`}
-            onClick={() => exitSketchMode()}
+            onClick={handleFinishSketch}
+            disabled={isBusy}
           >
-            Finish Sketch
+            {isEditingExisting ? 'Update Sketch' : 'Finish Sketch'}
           </button>
           <button
             className={`${buttonBase} text-red-400 hover:text-red-300 hover:bg-red-900/30`}

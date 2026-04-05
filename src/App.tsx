@@ -76,8 +76,42 @@ function useSketchKeyboardShortcuts() {
   }, [mode])
 }
 
+function useGlobalKeyboardShortcuts() {
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const store = useAppStore.getState()
+
+      // Undo: Ctrl/Cmd+Z (without Shift)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        // Don't undo while in sketch mode (would be confusing)
+        if (store.mode === 'modeling' && !store.isRebuilding) {
+          store.undo()
+        }
+        return
+      }
+
+      // Redo: Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y
+      if (
+        ((e.ctrlKey || e.metaKey) && e.key === 'z' && e.shiftKey) ||
+        ((e.ctrlKey || e.metaKey) && e.key === 'y')
+      ) {
+        e.preventDefault()
+        if (store.mode === 'modeling' && !store.isRebuilding) {
+          store.redo()
+        }
+        return
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+}
+
 function App() {
   useSketchKeyboardShortcuts()
+  useGlobalKeyboardShortcuts()
 
   return (
     <>

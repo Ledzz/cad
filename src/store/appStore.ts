@@ -8,7 +8,8 @@ import {
   createEmptySketch,
   generateEntityId,
 } from '../engine/sketchTypes'
-import type { Feature } from '../engine/featureTypes'
+import type { Feature, SketchFeature } from '../engine/featureTypes'
+import { generateFeatureId, restoreSketchEntities, snapshotSketch } from '../engine/featureTypes'
 import { rebuildAll } from '../engine/rebuild'
 
 // ─── Selection ──────────────────────────────────────────────
@@ -28,6 +29,10 @@ export interface EditingFeature {
   featureId: string
 }
 
+// ─── History ────────────────────────────────────────────────
+
+const MAX_HISTORY_SIZE = 50
+
 // ─── App State ──────────────────────────────────────────────
 
 export interface AppState {
@@ -38,6 +43,14 @@ export interface AppState {
   selection: SelectionState
   setSelection: (ids: string[]) => void
   setHovered: (id: string | null) => void
+
+  // ─── Undo / Redo ────────────────────────────────────────
+  history: Feature[][]
+  future: Feature[][]
+  undo: () => Promise<void>
+  redo: () => Promise<void>
+  canUndo: () => boolean
+  canRedo: () => boolean
 
   // ─── Features (parametric source of truth) ──────────────
   features: Feature[]
@@ -72,8 +85,14 @@ export interface AppState {
 
   // Sketch
   activeSketch: SketchState | null
+  /** The feature ID of the sketch being edited, or null if creating a new sketch */
+  editingSketchFeatureId: string | null
   enterSketchMode: (plane: SketchPlane) => void
+  /** Enter sketch mode to edit an existing SketchFeature */
+  editSketch: (featureId: string) => void
   exitSketchMode: () => void
+  /** Finish editing: save new sketch as feature or update existing */
+  confirmSketchEdit: () => Promise<void>
   setActiveSketchTool: (tool: SketchTool) => void
   addSketchEntity: (entity: SketchEntity) => SketchEntity
   addSketchEntities: (entities: SketchEntity[]) => SketchEntity[]
@@ -108,6 +127,40 @@ async function performRebuild(
   }
 }
 
+// ─── History helper ─────────────────────────────────────────
+
+/**
+ * Push the current features onto the history stack and clear the future.
+ * Call this before every mutation that changes `features`.
+ */
+function pushHistory(
+  get: () => AppState,
+  set: (partial: Partial<AppState>) => void
+) {
+  const { features, history } = get()
+  const newHistory = [...history, features]
+  // Cap history size
+  if (newHistory.length > MAX_HISTORY_SIZE) {
+    newHistory.shift()
+  }
+  set({ history: newHistory, future: [] })
+}
+
+/**
+ * Compute the next entity ID from existing sketch entities.
+ * Parses numeric suffixes like "point_3" → 3, returns max + 1.
+ */
+function computeNextEntityId(entities: Map<string, SketchEntity>): number {
+  let max = 0
+  for (const id of entities.keys()) {
+    const match = id.match(/_(\d+)$/)
+    if (match) {
+      max = Math.max(max, parseInt(match[1], 10))
+    }
+  }
+  return max + 1
+}
+
 // ─── Store ──────────────────────────────────────────────────
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -124,24 +177,63 @@ export const useAppStore = create<AppState>((set, get) => ({
   setHovered: (id) =>
     set((state) => ({ selection: { ...state.selection, hoveredId: id } })),
 
+  // ─── Undo / Redo ───────────────────────────────────────
+
+  history: [],
+  future: [],
+
+  canUndo: () => get().history.length > 0,
+  canRedo: () => get().future.length > 0,
+
+  undo: async () => {
+    const { history, features } = get()
+    if (history.length === 0) return
+
+    const newHistory = [...history]
+    const previous = newHistory.pop()!
+    set({
+      history: newHistory,
+      future: [...get().future, features],
+      features: previous,
+    })
+    await performRebuild(previous, set)
+  },
+
+  redo: async () => {
+    const { future, features } = get()
+    if (future.length === 0) return
+
+    const newFuture = [...future]
+    const next = newFuture.pop()!
+    set({
+      future: newFuture,
+      history: [...get().history, features],
+      features: next,
+    })
+    await performRebuild(next, set)
+  },
+
   // ─── Features ───────────────────────────────────────────
 
   features: [],
   isRebuilding: false,
 
   addFeature: async (feature) => {
+    pushHistory(get, set)
     const features = [...get().features, feature]
     set({ features })
     await performRebuild(features, set)
   },
 
   addFeatures: async (newFeatures) => {
+    pushHistory(get, set)
     const features = [...get().features, ...newFeatures]
     set({ features })
     await performRebuild(features, set)
   },
 
   updateFeature: async (id, updates) => {
+    pushHistory(get, set)
     const features = get().features.map((f) =>
       f.id === id ? { ...f, ...updates } as Feature : f
     )
@@ -150,6 +242,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   removeFeature: async (id) => {
+    pushHistory(get, set)
     const features = get().features.filter((f) => f.id !== id)
     set({ features, selection: { selectedIds: [], hoveredId: null } })
     await performRebuild(features, set)
@@ -160,6 +253,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const oldIndex = features.findIndex((f) => f.id === id)
     if (oldIndex === -1 || oldIndex === newIndex) return
 
+    pushHistory(get, set)
     const [feature] = features.splice(oldIndex, 1)
     features.splice(newIndex, 0, feature)
     set({ features })
@@ -167,6 +261,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   toggleSuppression: async (id) => {
+    pushHistory(get, set)
     const features = get().features.map((f) =>
       f.id === id ? { ...f, suppressed: !f.suppressed } : f
     )
@@ -175,6 +270,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   renameFeature: (id, name) => {
+    pushHistory(get, set)
     const features = get().features.map((f) =>
       f.id === id ? { ...f, name } : f
     )
@@ -209,6 +305,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   // ─── Sketch ─────────────────────────────────────────────
 
   activeSketch: null,
+  editingSketchFeatureId: null,
 
   enterSketchMode: (plane) => {
     sketchCounter++
@@ -216,6 +313,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       mode: 'sketching',
       activeSketch: sketch,
+      editingSketchFeatureId: null,
+      selection: { selectedIds: [], hoveredId: null },
+    })
+  },
+
+  editSketch: (featureId) => {
+    const feature = get().features.find((f) => f.id === featureId)
+    if (!feature || feature.type !== 'sketch') return
+
+    const sketchFeature = feature as SketchFeature
+    const entities = restoreSketchEntities(sketchFeature.sketch)
+    const nextEntityId = computeNextEntityId(entities)
+
+    const sketch: SketchState = {
+      id: sketchFeature.id,
+      plane: sketchFeature.sketch.plane,
+      entities,
+      selectedEntityIds: [],
+      hoveredEntityId: null,
+      activeTool: null,
+      drawingState: {
+        tool: null,
+        placedPointIds: [],
+        previewPosition: null,
+      },
+      nextEntityId,
+    }
+
+    set({
+      mode: 'sketching',
+      activeSketch: sketch,
+      editingSketchFeatureId: featureId,
       selection: { selectedIds: [], hoveredId: null },
     })
   },
@@ -224,7 +353,41 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       mode: 'modeling',
       activeSketch: null,
+      editingSketchFeatureId: null,
     })
+  },
+
+  confirmSketchEdit: async () => {
+    const { activeSketch, editingSketchFeatureId } = get()
+    if (!activeSketch) return
+
+    if (editingSketchFeatureId) {
+      // Updating an existing sketch feature
+      const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities)
+      // Use updateFeature which pushes history and rebuilds
+      set({
+        mode: 'modeling',
+        activeSketch: null,
+        editingSketchFeatureId: null,
+      })
+      await get().updateFeature(editingSketchFeatureId, { sketch: snapshot } as Partial<Feature>)
+    } else {
+      // Saving a new sketch as a feature (no extrude)
+      const sketchId = generateFeatureId('sketch')
+      const sketchFeature: SketchFeature = {
+        id: sketchId,
+        name: `Sketch (${activeSketch.plane.name})`,
+        type: 'sketch',
+        suppressed: false,
+        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+      }
+      set({
+        mode: 'modeling',
+        activeSketch: null,
+        editingSketchFeatureId: null,
+      })
+      await get().addFeature(sketchFeature)
+    }
   },
 
   setActiveSketchTool: (tool) => {

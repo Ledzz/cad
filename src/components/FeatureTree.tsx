@@ -73,8 +73,10 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
   const removeFeature = useAppStore((s) => s.removeFeature)
   const reorderFeature = useAppStore((s) => s.reorderFeature)
   const setEditingFeature = useAppStore((s) => s.setEditingFeature)
+  const editSketch = useAppStore((s) => s.editSketch)
 
   const hasEditableParams = feature.type === 'box' || feature.type === 'cylinder' || feature.type === 'sphere' || feature.type === 'extrude'
+  const isSketch = feature.type === 'sketch'
 
   useEffect(() => {
     const handleClick = () => onClose()
@@ -101,6 +103,16 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
     disabled?: boolean
     danger?: boolean
   }> = []
+
+  if (isSketch) {
+    items.push({
+      label: 'Edit Sketch...',
+      action: () => {
+        editSketch(feature.id)
+        onClose()
+      },
+    })
+  }
 
   if (hasEditableParams) {
     items.push({
@@ -180,6 +192,7 @@ export function FeatureTree() {
   const setSelection = useAppStore((s) => s.setSelection)
   const renameFeature = useAppStore((s) => s.renameFeature)
   const setEditingFeature = useAppStore((s) => s.setEditingFeature)
+  const editSketch = useAppStore((s) => s.editSketch)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -219,12 +232,12 @@ export function FeatureTree() {
                 }`}
                 onClick={() => setSelection([feature.id])}
                 onDoubleClick={() => {
-                  // Double-click to edit: for features with params, open edit dialog
-                  // For sketches, we could re-enter sketch mode in the future
-                  if (feature.type !== 'sketch') {
-                    setEditingFeature({ featureId: feature.id })
+                  if (feature.type === 'sketch') {
+                    // Double-click sketch to edit it
+                    editSketch(feature.id)
                   } else {
-                    setRenamingId(feature.id)
+                    // For other features, open parameter edit dialog
+                    setEditingFeature({ featureId: feature.id })
                   }
                 }}
                 onContextMenu={(e) => {
