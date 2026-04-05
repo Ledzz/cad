@@ -1,10 +1,71 @@
-import { Canvas } from '@react-three/fiber'
+import { Canvas, useThree } from '@react-three/fiber'
 import { OrbitControls, GizmoHelper, GizmoViewport, Grid } from '@react-three/drei'
 import { SceneObjects } from './SceneObjects'
+import { SketchRenderer } from './SketchRenderer'
+import { SketchInteraction } from './SketchInteraction'
 import { useOccInit } from '../hooks/useOccInit'
 import { useAppStore } from '../store/appStore'
+import { useEffect, useRef } from 'react'
+import * as THREE from 'three'
+
+/**
+ * Smoothly animates the camera to look at the sketch plane head-on.
+ */
+function SketchCameraController() {
+  const activeSketch = useAppStore((s) => s.activeSketch)
+  const { camera } = useThree()
+  const hasAnimated = useRef(false)
+
+  useEffect(() => {
+    if (!activeSketch || hasAnimated.current) return
+    hasAnimated.current = true
+
+    const plane = activeSketch.plane
+    const normal = new THREE.Vector3(...plane.normal)
+    const origin = new THREE.Vector3(...plane.origin)
+
+    // Position camera along the normal direction, looking at the origin
+    const distance = 30
+    const targetPos = origin.clone().add(normal.clone().multiplyScalar(distance))
+
+    // Animate camera position
+    const startPos = camera.position.clone()
+    const startTarget = new THREE.Vector3(0, 0, 0) // default look-at
+    const duration = 500 // ms
+    const startTime = performance.now()
+
+    function animate() {
+      const elapsed = performance.now() - startTime
+      const t = Math.min(elapsed / duration, 1)
+      // Ease-out cubic
+      const ease = 1 - Math.pow(1 - t, 3)
+
+      camera.position.lerpVectors(startPos, targetPos, ease)
+      camera.lookAt(
+        startTarget.x + (origin.x - startTarget.x) * ease,
+        startTarget.y + (origin.y - startTarget.y) * ease,
+        startTarget.z + (origin.z - startTarget.z) * ease
+      )
+
+      if (t < 1) {
+        requestAnimationFrame(animate)
+      }
+    }
+
+    animate()
+
+    return () => {
+      hasAnimated.current = false
+    }
+  }, [activeSketch, camera])
+
+  return null
+}
 
 function SceneContent() {
+  const mode = useAppStore((s) => s.mode)
+  const isSketchMode = mode === 'sketching'
+
   return (
     <>
       {/* Lighting */}
@@ -33,13 +94,23 @@ function SceneContent() {
       {/* OCCT-generated scene objects */}
       <SceneObjects />
 
-      {/* Camera controls — click on empty space deselects */}
+      {/* Sketch overlay (only in sketch mode) */}
+      {isSketchMode && (
+        <>
+          <SketchRenderer />
+          <SketchInteraction />
+          <SketchCameraController />
+        </>
+      )}
+
+      {/* Camera controls — disabled orbit in sketch mode, allow pan+zoom only */}
       <OrbitControls
         makeDefault
         enableDamping
         dampingFactor={0.1}
         minDistance={1}
         maxDistance={500}
+        enableRotate={!isSketchMode}
       />
 
       {/* Orientation gizmo in top-right corner */}
@@ -80,6 +151,16 @@ function ErrorOverlay({ message }: { message: string }) {
 export function Viewport() {
   const { loading, error } = useOccInit()
   const setSelection = useAppStore((s) => s.setSelection)
+  const mode = useAppStore((s) => s.mode)
+  const setSketchSelection = useAppStore((s) => s.setSketchSelection)
+
+  const handlePointerMissed = () => {
+    if (mode === 'sketching') {
+      setSketchSelection([])
+    } else {
+      setSelection([])
+    }
+  }
 
   return (
     <div className="flex-1 relative bg-[#1a1a2e]">
@@ -93,7 +174,7 @@ export function Viewport() {
           far: 1000,
         }}
         gl={{ antialias: true }}
-        onPointerMissed={() => setSelection([])}
+        onPointerMissed={handlePointerMissed}
       >
         <SceneContent />
       </Canvas>

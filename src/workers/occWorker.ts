@@ -208,6 +208,215 @@ const occWorkerApi = {
     builder.delete()
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
   },
+
+  /**
+   * Build a wire (closed loop) from an array of edge definitions, then create a face.
+   * Each edge is defined by its type and 3D points.
+   */
+  makeWireFromEdges(
+    edges: Array<{
+      type: 'line' | 'arc' | 'circle'
+      points: number[][] // each point is [x, y, z]
+      radius?: number
+      normal?: number[]
+    }>
+  ): { success: boolean; error?: string } {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const wireBuilder = new oc.BRepBuilderAPI_MakeWire_1()
+    const edgesToDelete: any[] = []
+
+    try {
+      for (const edge of edges) {
+        switch (edge.type) {
+          case 'line': {
+            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
+            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_3(p1, p2)
+            if (!edgeBuilder.IsDone()) {
+              edgeBuilder.delete(); p1.delete(); p2.delete()
+              return { success: false, error: 'Failed to create line edge' }
+            }
+            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
+            wireBuilder.Add_1(occEdge)
+            edgesToDelete.push(edgeBuilder)
+            p1.delete(); p2.delete()
+            break
+          }
+          case 'arc': {
+            // Arc through 3 points: start, mid, end
+            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
+            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
+            const p3 = new oc.gp_Pnt_3(edge.points[2][0], edge.points[2][1], edge.points[2][2])
+            // _4: (const gp_Pnt& P1, const gp_Pnt& P2, const gp_Pnt& P3) — arc through 3 points
+            const arcBuilder = new oc.GC_MakeArcOfCircle_4(p1, p2, p3)
+            if (!arcBuilder.IsDone()) {
+              arcBuilder.delete(); p1.delete(); p2.delete(); p3.delete()
+              return { success: false, error: 'Failed to create arc' }
+            }
+            const curve = arcBuilder.Value()
+            // _24: (const Handle<Geom_Curve>& L) — edge from full curve (TrimmedCurve has proper bounds)
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
+            if (!edgeBuilder.IsDone()) {
+              edgeBuilder.delete(); arcBuilder.delete(); p1.delete(); p2.delete(); p3.delete()
+              return { success: false, error: 'Failed to create arc edge' }
+            }
+            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
+            wireBuilder.Add_1(occEdge)
+            edgesToDelete.push(edgeBuilder, arcBuilder)
+            p1.delete(); p2.delete(); p3.delete()
+            break
+          }
+          case 'circle': {
+            // Full circle: center, normal, radius
+            const center = edge.points[0]
+            const normal = edge.normal || [0, 0, 1]
+            const radius = edge.radius || 1
+            const pnt = new oc.gp_Pnt_3(center[0], center[1], center[2])
+            const dir = new oc.gp_Dir_4(normal[0], normal[1], normal[2])
+            const ax = new oc.gp_Ax2_3(pnt, dir)
+            // _2: (const gp_Ax2& A2, Standard_Real Radius)
+            const circleBuilder = new oc.GC_MakeCircle_2(ax, radius)
+            if (!circleBuilder.IsDone()) {
+              circleBuilder.delete(); pnt.delete(); dir.delete(); ax.delete()
+              return { success: false, error: 'Failed to create circle' }
+            }
+            const curve = circleBuilder.Value()
+            // _24: (const Handle<Geom_Curve>& L) — edge from full curve
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
+            if (!edgeBuilder.IsDone()) {
+              edgeBuilder.delete(); circleBuilder.delete(); pnt.delete(); dir.delete(); ax.delete()
+              return { success: false, error: 'Failed to create circle edge' }
+            }
+            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
+            wireBuilder.Add_1(occEdge)
+            edgesToDelete.push(edgeBuilder, circleBuilder)
+            pnt.delete(); dir.delete(); ax.delete()
+            break
+          }
+        }
+      }
+
+      if (!wireBuilder.IsDone()) {
+        return { success: false, error: 'Failed to build wire from edges' }
+      }
+
+      return { success: true }
+    } finally {
+      for (const e of edgesToDelete) e.delete()
+      wireBuilder.delete()
+    }
+  },
+
+  /**
+   * Build a solid by extruding a sketch profile.
+   * Takes sketch entities (lines, arcs, circles) as 3D-projected edges,
+   * builds a wire → face → prism.
+   */
+  extrudeSketch(
+    id: string,
+    edges: Array<{
+      type: 'line' | 'arc' | 'circle'
+      points: number[][]
+      radius?: number
+      normal?: number[]
+    }>,
+    extrudeDirection: [number, number, number],
+    extrudeDistance: number
+  ): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const wireBuilder = new oc.BRepBuilderAPI_MakeWire_1()
+    const toDelete: any[] = [wireBuilder]
+
+    try {
+      // Build edges and add to wire
+      for (const edge of edges) {
+        switch (edge.type) {
+          case 'line': {
+            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
+            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_3(p1, p2)
+            if (!edgeBuilder.IsDone()) throw new Error('Failed to create line edge')
+            wireBuilder.Add_1(oc.TopoDS.Edge_1(edgeBuilder.Shape()))
+            toDelete.push(edgeBuilder)
+            p1.delete(); p2.delete()
+            break
+          }
+          case 'arc': {
+            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
+            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
+            const p3 = new oc.gp_Pnt_3(edge.points[2][0], edge.points[2][1], edge.points[2][2])
+            const arcBuilder = new oc.GC_MakeArcOfCircle_4(p1, p2, p3)
+            if (!arcBuilder.IsDone()) throw new Error('Failed to create arc')
+            const curve = arcBuilder.Value()
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
+            if (!edgeBuilder.IsDone()) throw new Error('Failed to create arc edge')
+            wireBuilder.Add_1(oc.TopoDS.Edge_1(edgeBuilder.Shape()))
+            toDelete.push(edgeBuilder, arcBuilder)
+            p1.delete(); p2.delete(); p3.delete()
+            break
+          }
+          case 'circle': {
+            const center = edge.points[0]
+            const normal = edge.normal || [0, 0, 1]
+            const radius = edge.radius || 1
+            const pnt = new oc.gp_Pnt_3(center[0], center[1], center[2])
+            const dir = new oc.gp_Dir_4(normal[0], normal[1], normal[2])
+            const ax = new oc.gp_Ax2_3(pnt, dir)
+            const circleBuilder = new oc.GC_MakeCircle_2(ax, radius)
+            if (!circleBuilder.IsDone()) throw new Error('Failed to create circle')
+            const curve = circleBuilder.Value()
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
+            if (!edgeBuilder.IsDone()) throw new Error('Failed to create circle edge')
+            wireBuilder.Add_1(oc.TopoDS.Edge_1(edgeBuilder.Shape()))
+            toDelete.push(edgeBuilder, circleBuilder)
+            pnt.delete(); dir.delete(); ax.delete()
+            break
+          }
+        }
+      }
+
+      if (!wireBuilder.IsDone()) {
+        throw new Error('Failed to build wire')
+      }
+
+      const wire = wireBuilder.Wire()
+
+      // Create face from wire
+      // _15: (const TopoDS_Wire& W, Standard_Boolean OnlyPlane)
+      const faceBuilder = new oc.BRepBuilderAPI_MakeFace_15(wire, true)
+      toDelete.push(faceBuilder)
+      if (!faceBuilder.IsDone()) {
+        throw new Error('Failed to create face from wire')
+      }
+
+      const face = faceBuilder.Shape()
+
+      // Extrude the face
+      const vec = new oc.gp_Vec_4(
+        extrudeDirection[0] * extrudeDistance,
+        extrudeDirection[1] * extrudeDistance,
+        extrudeDirection[2] * extrudeDistance
+      )
+      const prism = new oc.BRepPrimAPI_MakePrism_1(face, vec, false, true)
+      toDelete.push(prism)
+      vec.delete()
+
+      if (!prism.IsDone()) {
+        throw new Error('Extrude failed')
+      }
+
+      const solid = prism.Shape()
+      const result = tessellateShape(solid, id)
+
+      return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+    } finally {
+      for (const obj of toDelete) {
+        try { obj.delete() } catch { /* ignore cleanup errors */ }
+      }
+    }
+  },
 }
 
 export type OccWorkerApi = typeof occWorkerApi

@@ -35,6 +35,33 @@
 
 ---
 
+## Development Guidelines
+
+### OpenCascade.js API Bindings
+
+opencascade.js exposes OCCT C++ constructors as numbered variants (e.g., `BRepBuilderAPI_MakeFace_1`, `_2`, ..., `_22`). The variant numbers correspond to the order of constructor overloads in the OCCT C++ headers. **Do NOT guess these numbers from documentation or memory.**
+
+Before using any new opencascade.js constructor:
+
+1. **Verify the variant exists** in the WASM binary:
+   ```bash
+   strings node_modules/opencascade.js/dist/opencascade.wasm.wasm | grep 'ClassName_'
+   ```
+
+2. **Verify the constructor signature** by cross-referencing the OCCT C++ header documentation (https://dev.opencascade.org/doc/refman/html/) — constructors are numbered sequentially in declaration order starting from `_1`.
+
+3. **Document the mapping** in `src/engine/occTypes.ts` with a comment showing which C++ overload each variant corresponds to, e.g.:
+   ```typescript
+   // _15: (const TopoDS_Wire& W, Standard_Boolean OnlyPlane)
+   BRepBuilderAPI_MakeFace_15: new (wire: TopoDSWire, onlyPlane: boolean) => BRepBuilderAPI_MakeFace
+   ```
+
+4. **Test at runtime** before assuming a variant works — the WASM binding will throw if the wrong argument types are passed, with errors like `"Expected null or instance of X, got an instance of Y"`.
+
+Common pitfall: the variant numbers do NOT match what you might expect from the number of arguments alone. For example, `BRepBuilderAPI_MakeFace_8` takes `(Handle<Geom_Surface>, Real)`, not `(TopoDS_Wire, Boolean)` — that's `_15`.
+
+---
+
 ## Phase 1 — Foundation (Weeks 1–6)
 
 **Goal:** Render 3D geometry in the browser using OpenCascade.js + Three.js.
