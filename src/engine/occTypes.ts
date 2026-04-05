@@ -11,6 +11,8 @@ export interface OpenCascadeInstance {
   gp_Pnt_3: new (x: number, y: number, z: number) => GpPnt
   gp_Dir_4: new (x: number, y: number, z: number) => GpDir
   gp_Ax2_3: new (pnt: GpPnt, dir: GpDir) => GpAx2
+  // _2: (const gp_Ax2& A2, Standard_Real Radius)
+  gp_Circ_2: new (ax: GpAx2, radius: number) => GpCirc
   gp_Trsf_1: new () => GpTrsf
   gp_Vec_4: new (x: number, y: number, z: number) => GpVec
 
@@ -24,6 +26,8 @@ export interface OpenCascadeInstance {
   // Edge/Wire/Face builders (for sketch)
   // _3: (const gp_Pnt& P1, const gp_Pnt& P2)
   BRepBuilderAPI_MakeEdge_3: new (p1: GpPnt, p2: GpPnt) => BRepBuilderAPI_MakeEdge
+  // _8: (const gp_Circ& L) — full circle edge from gp_Circ
+  BRepBuilderAPI_MakeEdge_8: new (circ: GpCirc) => BRepBuilderAPI_MakeEdge
   // _24: (const Handle<Geom_Curve>& L) — edge from full curve (respects TrimmedCurve bounds)
   BRepBuilderAPI_MakeEdge_24: new (curve: Handle_Geom_Curve) => BRepBuilderAPI_MakeEdge
   // _1: () — empty constructor
@@ -90,6 +94,10 @@ export interface GpDir {
 }
 
 export interface GpAx2 {
+  delete(): void
+}
+
+export interface GpCirc {
   delete(): void
 }
 

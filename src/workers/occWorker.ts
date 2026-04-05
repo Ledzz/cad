@@ -5,6 +5,14 @@ import type { TessellationData, FaceRange } from '../engine/tessellation'
 
 let oc: OpenCascadeInstance | null = null
 
+// ─── Shape Registry ─────────────────────────────────────────
+// Keeps OCCT shapes in WASM memory so downstream features
+// (boolean ops, fillets, etc.) can reference upstream results.
+
+const shapeRegistry = new Map<string, TopoDSShape>()
+
+// ─── Tessellation ───────────────────────────────────────────
+
 /**
  * Tessellate an OCCT TopoDS_Shape into flat arrays suitable for Three.js BufferGeometry.
  */
@@ -164,6 +172,8 @@ function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1,
   }
 }
 
+// ─── Worker API ─────────────────────────────────────────────
+
 /**
  * The API exposed via Comlink from this Web Worker.
  */
@@ -182,10 +192,44 @@ const occWorkerApi = {
     }
   },
 
+  // ─── Shape Registry ─────────────────────────────────────
+
+  /** Delete a stored shape and free its WASM memory. */
+  deleteShape(id: string): void {
+    const shape = shapeRegistry.get(id)
+    if (shape) {
+      try { shape.delete() } catch { /* ignore */ }
+      shapeRegistry.delete(id)
+    }
+  },
+
+  /** Delete all stored shapes and free WASM memory. */
+  clearShapes(): void {
+    for (const [, shape] of shapeRegistry) {
+      try { shape.delete() } catch { /* ignore */ }
+    }
+    shapeRegistry.clear()
+  },
+
+  /** Tessellate a previously stored shape by its ID. */
+  tessellateStoredShape(id: string): TessellationData {
+    const shape = shapeRegistry.get(id)
+    if (!shape) throw new Error(`Shape "${id}" not found in registry`)
+    const result = tessellateShape(shape, id)
+    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+
+  // ─── Primitive Builders ─────────────────────────────────
+
   makeBox(id: string, dx: number, dy: number, dz: number): TessellationData {
     if (!oc) throw new Error('OpenCascade not initialized')
     const builder = new oc.BRepPrimAPI_MakeBox_1(dx, dy, dz)
     const shape = builder.Shape()
+
+    // Store shape in registry (delete old one if exists)
+    occWorkerApi.deleteShape(id)
+    shapeRegistry.set(id, shape)
+
     const result = tessellateShape(shape, id)
     builder.delete()
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
@@ -195,6 +239,10 @@ const occWorkerApi = {
     if (!oc) throw new Error('OpenCascade not initialized')
     const builder = new oc.BRepPrimAPI_MakeCylinder_1(radius, height)
     const shape = builder.Shape()
+
+    occWorkerApi.deleteShape(id)
+    shapeRegistry.set(id, shape)
+
     const result = tessellateShape(shape, id)
     builder.delete()
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
@@ -204,114 +252,19 @@ const occWorkerApi = {
     if (!oc) throw new Error('OpenCascade not initialized')
     const builder = new oc.BRepPrimAPI_MakeSphere_1(radius)
     const shape = builder.Shape()
+
+    occWorkerApi.deleteShape(id)
+    shapeRegistry.set(id, shape)
+
     const result = tessellateShape(shape, id)
     builder.delete()
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
   },
 
   /**
-   * Build a wire (closed loop) from an array of edge definitions, then create a face.
-   * Each edge is defined by its type and 3D points.
-   */
-  makeWireFromEdges(
-    edges: Array<{
-      type: 'line' | 'arc' | 'circle'
-      points: number[][] // each point is [x, y, z]
-      radius?: number
-      normal?: number[]
-    }>
-  ): { success: boolean; error?: string } {
-    if (!oc) throw new Error('OpenCascade not initialized')
-
-    const wireBuilder = new oc.BRepBuilderAPI_MakeWire_1()
-    const edgesToDelete: any[] = []
-
-    try {
-      for (const edge of edges) {
-        switch (edge.type) {
-          case 'line': {
-            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
-            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
-            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_3(p1, p2)
-            if (!edgeBuilder.IsDone()) {
-              edgeBuilder.delete(); p1.delete(); p2.delete()
-              return { success: false, error: 'Failed to create line edge' }
-            }
-            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
-            wireBuilder.Add_1(occEdge)
-            edgesToDelete.push(edgeBuilder)
-            p1.delete(); p2.delete()
-            break
-          }
-          case 'arc': {
-            // Arc through 3 points: start, mid, end
-            const p1 = new oc.gp_Pnt_3(edge.points[0][0], edge.points[0][1], edge.points[0][2])
-            const p2 = new oc.gp_Pnt_3(edge.points[1][0], edge.points[1][1], edge.points[1][2])
-            const p3 = new oc.gp_Pnt_3(edge.points[2][0], edge.points[2][1], edge.points[2][2])
-            // _4: (const gp_Pnt& P1, const gp_Pnt& P2, const gp_Pnt& P3) — arc through 3 points
-            const arcBuilder = new oc.GC_MakeArcOfCircle_4(p1, p2, p3)
-            if (!arcBuilder.IsDone()) {
-              arcBuilder.delete(); p1.delete(); p2.delete(); p3.delete()
-              return { success: false, error: 'Failed to create arc' }
-            }
-            const curve = arcBuilder.Value()
-            // _24: (const Handle<Geom_Curve>& L) — edge from full curve (TrimmedCurve has proper bounds)
-            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
-            if (!edgeBuilder.IsDone()) {
-              edgeBuilder.delete(); arcBuilder.delete(); p1.delete(); p2.delete(); p3.delete()
-              return { success: false, error: 'Failed to create arc edge' }
-            }
-            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
-            wireBuilder.Add_1(occEdge)
-            edgesToDelete.push(edgeBuilder, arcBuilder)
-            p1.delete(); p2.delete(); p3.delete()
-            break
-          }
-          case 'circle': {
-            // Full circle: center, normal, radius
-            const center = edge.points[0]
-            const normal = edge.normal || [0, 0, 1]
-            const radius = edge.radius || 1
-            const pnt = new oc.gp_Pnt_3(center[0], center[1], center[2])
-            const dir = new oc.gp_Dir_4(normal[0], normal[1], normal[2])
-            const ax = new oc.gp_Ax2_3(pnt, dir)
-            // _2: (const gp_Ax2& A2, Standard_Real Radius)
-            const circleBuilder = new oc.GC_MakeCircle_2(ax, radius)
-            if (!circleBuilder.IsDone()) {
-              circleBuilder.delete(); pnt.delete(); dir.delete(); ax.delete()
-              return { success: false, error: 'Failed to create circle' }
-            }
-            const curve = circleBuilder.Value()
-            // _24: (const Handle<Geom_Curve>& L) — edge from full curve
-            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
-            if (!edgeBuilder.IsDone()) {
-              edgeBuilder.delete(); circleBuilder.delete(); pnt.delete(); dir.delete(); ax.delete()
-              return { success: false, error: 'Failed to create circle edge' }
-            }
-            const occEdge = oc.TopoDS.Edge_1(edgeBuilder.Shape())
-            wireBuilder.Add_1(occEdge)
-            edgesToDelete.push(edgeBuilder, circleBuilder)
-            pnt.delete(); dir.delete(); ax.delete()
-            break
-          }
-        }
-      }
-
-      if (!wireBuilder.IsDone()) {
-        return { success: false, error: 'Failed to build wire from edges' }
-      }
-
-      return { success: true }
-    } finally {
-      for (const e of edgesToDelete) e.delete()
-      wireBuilder.delete()
-    }
-  },
-
-  /**
    * Build a solid by extruding a sketch profile.
    * Takes sketch entities (lines, arcs, circles) as 3D-projected edges,
-   * builds a wire → face → prism.
+   * builds a wire → face → prism. Stores the resulting shape in the registry.
    */
   extrudeSketch(
     id: string,
@@ -364,14 +317,16 @@ const occWorkerApi = {
             const pnt = new oc.gp_Pnt_3(center[0], center[1], center[2])
             const dir = new oc.gp_Dir_4(normal[0], normal[1], normal[2])
             const ax = new oc.gp_Ax2_3(pnt, dir)
-            const circleBuilder = new oc.GC_MakeCircle_2(ax, radius)
-            if (!circleBuilder.IsDone()) throw new Error('Failed to create circle')
-            const curve = circleBuilder.Value()
-            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_24(curve)
+            // Use gp_Circ + MakeEdge_8 instead of GC_MakeCircle + MakeEdge_24,
+            // because opencascade.js cannot upcast Handle<Geom_Circle> to Handle<Geom_Curve>.
+            // _2: (const gp_Ax2& A2, Standard_Real Radius)
+            const circ = new oc.gp_Circ_2(ax, radius)
+            // _8: (const gp_Circ& L) — full circle edge
+            const edgeBuilder = new oc.BRepBuilderAPI_MakeEdge_8(circ)
             if (!edgeBuilder.IsDone()) throw new Error('Failed to create circle edge')
             wireBuilder.Add_1(oc.TopoDS.Edge_1(edgeBuilder.Shape()))
-            toDelete.push(edgeBuilder, circleBuilder)
-            pnt.delete(); dir.delete(); ax.delete()
+            toDelete.push(edgeBuilder)
+            circ.delete(); pnt.delete(); dir.delete(); ax.delete()
             break
           }
         }
@@ -408,6 +363,11 @@ const occWorkerApi = {
       }
 
       const solid = prism.Shape()
+
+      // Store in registry
+      occWorkerApi.deleteShape(id)
+      shapeRegistry.set(id, solid)
+
       const result = tessellateShape(solid, id)
 
       return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])

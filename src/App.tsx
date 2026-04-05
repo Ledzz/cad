@@ -3,6 +3,7 @@ import { Toolbar } from './components/Toolbar'
 import { FeatureTree } from './components/FeatureTree'
 import { Viewport } from './components/Viewport'
 import { PropertiesPanel } from './components/PropertiesPanel'
+import { FeatureEditDialog } from './components/FeatureEditDialog'
 import { useAppStore } from './store/appStore'
 
 function useSketchKeyboardShortcuts() {
@@ -86,6 +87,7 @@ function App() {
         <Viewport />
         <PropertiesPanel />
       </div>
+      <FeatureEditDialog />
     </>
   )
 }

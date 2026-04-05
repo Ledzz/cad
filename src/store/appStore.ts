@@ -8,6 +8,8 @@ import {
   createEmptySketch,
   generateEntityId,
 } from '../engine/sketchTypes'
+import type { Feature } from '../engine/featureTypes'
+import { rebuildAll } from '../engine/rebuild'
 
 // ─── Selection ──────────────────────────────────────────────
 
@@ -20,6 +22,12 @@ export interface SelectionState {
 
 export type AppMode = 'modeling' | 'sketching'
 
+// ─── Feature editing state ──────────────────────────────────
+
+export interface EditingFeature {
+  featureId: string
+}
+
 // ─── App State ──────────────────────────────────────────────
 
 export interface AppState {
@@ -31,7 +39,32 @@ export interface AppState {
   setSelection: (ids: string[]) => void
   setHovered: (id: string | null) => void
 
-  // Scene objects (tessellated meshes from OCCT)
+  // ─── Features (parametric source of truth) ──────────────
+  features: Feature[]
+  /** Add a feature to the end of the list and rebuild. */
+  addFeature: (feature: Feature) => Promise<void>
+  /** Add multiple features and rebuild once. */
+  addFeatures: (features: Feature[]) => Promise<void>
+  /** Update a feature's parameters and rebuild. */
+  updateFeature: (id: string, updates: Partial<Feature>) => Promise<void>
+  /** Remove a feature and rebuild. */
+  removeFeature: (id: string) => Promise<void>
+  /** Reorder a feature to a new index and rebuild. */
+  reorderFeature: (id: string, newIndex: number) => Promise<void>
+  /** Toggle a feature's suppressed state and rebuild. */
+  toggleSuppression: (id: string) => Promise<void>
+  /** Rename a feature (no rebuild needed). */
+  renameFeature: (id: string, name: string) => void
+  /** Full rebuild from features list. */
+  rebuild: () => Promise<void>
+  /** Whether a rebuild is currently in progress. */
+  isRebuilding: boolean
+
+  // ─── Feature editing ────────────────────────────────────
+  editingFeature: EditingFeature | null
+  setEditingFeature: (editing: EditingFeature | null) => void
+
+  // Scene objects (tessellated meshes — derived from features via rebuild)
   sceneObjects: Map<string, THREE.BufferGeometry>
   addSceneObject: (id: string, geometry: THREE.BufferGeometry) => void
   removeSceneObject: (id: string) => void
@@ -59,6 +92,22 @@ export interface AppState {
 
 let sketchCounter = 0
 
+// ─── Rebuild helper ─────────────────────────────────────────
+
+async function performRebuild(
+  features: Feature[],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void
+) {
+  set({ isRebuilding: true })
+  try {
+    const geometries = await rebuildAll(features)
+    set({ sceneObjects: geometries, isRebuilding: false })
+  } catch (err) {
+    console.error('[Store] Rebuild failed:', err)
+    set({ isRebuilding: false })
+  }
+}
+
 // ─── Store ──────────────────────────────────────────────────
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -75,7 +124,73 @@ export const useAppStore = create<AppState>((set, get) => ({
   setHovered: (id) =>
     set((state) => ({ selection: { ...state.selection, hoveredId: id } })),
 
-  // Scene objects
+  // ─── Features ───────────────────────────────────────────
+
+  features: [],
+  isRebuilding: false,
+
+  addFeature: async (feature) => {
+    const features = [...get().features, feature]
+    set({ features })
+    await performRebuild(features, set)
+  },
+
+  addFeatures: async (newFeatures) => {
+    const features = [...get().features, ...newFeatures]
+    set({ features })
+    await performRebuild(features, set)
+  },
+
+  updateFeature: async (id, updates) => {
+    const features = get().features.map((f) =>
+      f.id === id ? { ...f, ...updates } as Feature : f
+    )
+    set({ features })
+    await performRebuild(features, set)
+  },
+
+  removeFeature: async (id) => {
+    const features = get().features.filter((f) => f.id !== id)
+    set({ features, selection: { selectedIds: [], hoveredId: null } })
+    await performRebuild(features, set)
+  },
+
+  reorderFeature: async (id, newIndex) => {
+    const features = [...get().features]
+    const oldIndex = features.findIndex((f) => f.id === id)
+    if (oldIndex === -1 || oldIndex === newIndex) return
+
+    const [feature] = features.splice(oldIndex, 1)
+    features.splice(newIndex, 0, feature)
+    set({ features })
+    await performRebuild(features, set)
+  },
+
+  toggleSuppression: async (id) => {
+    const features = get().features.map((f) =>
+      f.id === id ? { ...f, suppressed: !f.suppressed } : f
+    )
+    set({ features })
+    await performRebuild(features, set)
+  },
+
+  renameFeature: (id, name) => {
+    const features = get().features.map((f) =>
+      f.id === id ? { ...f, name } : f
+    )
+    set({ features })
+  },
+
+  rebuild: async () => {
+    await performRebuild(get().features, set)
+  },
+
+  // ─── Feature editing ───────────────────────────────────
+
+  editingFeature: null,
+  setEditingFeature: (editing) => set({ editingFeature: editing }),
+
+  // Scene objects (still used for rendering — populated by rebuild)
   sceneObjects: new Map(),
   addSceneObject: (id, geometry) =>
     set((state) => {

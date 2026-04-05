@@ -1,7 +1,12 @@
 import { useState } from 'react'
 import { useAppStore } from '../store/appStore'
 import { SKETCH_PLANES } from '../engine/sketchTypes'
-import { extrudeCurrentSketch } from '../engine/sketchToSolid'
+import {
+  generateFeatureId,
+  snapshotSketch,
+  type SketchFeature,
+  type ExtrudeFeature,
+} from '../engine/featureTypes'
 
 const buttonBase =
   'px-2 py-1 text-xs rounded transition-colors cursor-pointer select-none'
@@ -10,15 +15,14 @@ const buttonIdle =
 const buttonActive =
   `${buttonBase} text-white bg-blue-600 hover:bg-blue-500`
 
-let extrudeCounter = 0
-
 export function Toolbar() {
   const mode = useAppStore((s) => s.mode)
   const activeSketch = useAppStore((s) => s.activeSketch)
   const enterSketchMode = useAppStore((s) => s.enterSketchMode)
   const exitSketchMode = useAppStore((s) => s.exitSketchMode)
   const setActiveSketchTool = useAppStore((s) => s.setActiveSketchTool)
-  const addSceneObject = useAppStore((s) => s.addSceneObject)
+  const addFeatures = useAppStore((s) => s.addFeatures)
+  const isRebuilding = useAppStore((s) => s.isRebuilding)
   const [extruding, setExtruding] = useState(false)
 
   const activeTool = activeSketch?.activeTool ?? null
@@ -44,10 +48,31 @@ export function Toolbar() {
 
     setExtruding(true)
     try {
-      extrudeCounter++
-      const id = `extrude-${extrudeCounter}`
-      const geometry = await extrudeCurrentSketch(activeSketch, distance, id)
-      addSceneObject(id, geometry)
+      // Create a SketchFeature (snapshot of current sketch)
+      const sketchId = generateFeatureId('sketch')
+      const sketchFeature: SketchFeature = {
+        id: sketchId,
+        name: `Sketch (${activeSketch.plane.name})`,
+        type: 'sketch',
+        suppressed: false,
+        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+      }
+
+      // Create an ExtrudeFeature referencing the sketch
+      const extrudeId = generateFeatureId('extrude')
+      const extrudeFeature: ExtrudeFeature = {
+        id: extrudeId,
+        name: `Extrude (${Math.abs(distance)}mm)`,
+        type: 'extrude',
+        suppressed: false,
+        sketchId,
+        distance: Math.abs(distance),
+        direction: distance > 0 ? 'normal' : 'reverse',
+      }
+
+      // Add both features and rebuild
+      await addFeatures([sketchFeature, extrudeFeature])
+
       exitSketchMode()
     } catch (err) {
       console.error('[Toolbar] Extrude failed:', err)
@@ -56,6 +81,8 @@ export function Toolbar() {
       setExtruding(false)
     }
   }
+
+  const isBusy = extruding || isRebuilding
 
   return (
     <div className="h-10 bg-[#16162a] border-b border-[#2a2a4a] flex items-center px-3 gap-2 shrink-0">
@@ -71,10 +98,16 @@ export function Toolbar() {
               key={name}
               className={buttonIdle}
               onClick={() => enterSketchMode(plane)}
+              disabled={isBusy}
             >
               {name}
             </button>
           ))}
+          {isRebuilding && (
+            <span className="text-xs text-yellow-400 ml-2 animate-pulse">
+              Rebuilding...
+            </span>
+          )}
         </>
       ) : (
         <>
@@ -120,7 +153,7 @@ export function Toolbar() {
           <button
             className={`${buttonBase} text-purple-400 hover:text-purple-300 hover:bg-purple-900/30`}
             onClick={handleFinishAndExtrude}
-            disabled={extruding}
+            disabled={isBusy}
           >
             {extruding ? 'Extruding...' : 'Extrude'}
           </button>
