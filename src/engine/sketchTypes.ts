@@ -275,6 +275,17 @@ export type SnapTarget =
   | { type: 'axis-y'; x: number; y: number }
   | null
 
+// ─── Selection Rectangle ────────────────────────────────────
+
+export interface SelectionRect {
+  /** Start position in sketch 2D coords */
+  startX: number
+  startY: number
+  /** Current end position in sketch 2D coords */
+  endX: number
+  endY: number
+}
+
 // ─── Full Sketch State ─────────────────────────────────────
 
 /** Active constraint tool */
@@ -314,6 +325,8 @@ export interface SketchState {
   activeConstraintTool: ConstraintTool
   /** Current drawing operation state */
   drawingState: DrawingState
+  /** Active selection rectangle (drag-to-select), or null */
+  selectionRect: SelectionRect | null
   /** Next entity ID counter */
   nextEntityId: number
 }
@@ -339,6 +352,7 @@ export function createEmptySketch(id: string, plane: SketchPlane): SketchState {
       placedPointIds: [],
       previewPosition: null,
     },
+    selectionRect: null,
     nextEntityId: 1,
   }
 }

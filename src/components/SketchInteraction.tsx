@@ -10,8 +10,8 @@ import type {
 // ─── Constants ──────────────────────────────────────────────
 
 const SNAP_DISTANCE = 0.5 // world units
-const GRID_SNAP_SIZE = 1.0
 const ENTITY_HIT_THRESHOLD = 0.4 // how close a click must be to select an entity
+const DRAG_SELECT_THRESHOLD = 0.15 // minimum drag distance to start a selection rectangle
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -54,14 +54,10 @@ function findSnap(
 
   if (snapped) return { ...snappedPos, snapped: true }
 
-  // Grid snap
-  const gridX = Math.round(pos.x / GRID_SNAP_SIZE) * GRID_SNAP_SIZE
-  const gridY = Math.round(pos.y / GRID_SNAP_SIZE) * GRID_SNAP_SIZE
-  const gridDx = pos.x - gridX
-  const gridDy = pos.y - gridY
-  const gridDist = Math.sqrt(gridDx * gridDx + gridDy * gridDy)
-  if (gridDist < snapDistance * 0.7) {
-    return { x: gridX, y: gridY, snapped: true }
+  // Origin snap — snap to (0,0) if close enough
+  const originDist = Math.sqrt(pos.x * pos.x + pos.y * pos.y)
+  if (originDist < snapDistance) {
+    return { x: 0, y: 0, snapped: true }
   }
 
   return { ...pos, snapped: false }
@@ -231,11 +227,18 @@ export function SketchInteraction() {
   const dragSketchPoint = useAppStore((s) => s.dragSketchPoint)
   const setSketchSelection = useAppStore((s) => s.setSketchSelection)
   const setSketchHovered = useAppStore((s) => s.setSketchHovered)
+  const setSelectionRect = useAppStore((s) => s.setSelectionRect)
   const { raycaster, camera, pointer } = useThree()
 
-  // Track drag state
+  // Track point drag state
   const dragState = useRef<{
     pointId: string
+    isDragging: boolean
+  } | null>(null)
+
+  // Track selection rectangle drag state
+  const selectDragState = useRef<{
+    startPos: { x: number; y: number }
     isDragging: boolean
   } | null>(null)
 
@@ -272,6 +275,18 @@ export function SketchInteraction() {
     return { x: snapped.x, y: snapped.y }
   }, [planeData, activeSketch, raycaster, pointer, camera])
 
+  // Raycast pointer onto sketch plane → 2D coords (no snapping, for selection rect)
+  const getRawSketchPosition = useCallback((): { x: number; y: number } | null => {
+    if (!planeData) return null
+
+    raycaster.setFromCamera(pointer, camera)
+    const intersection = new THREE.Vector3()
+    const hit = raycaster.ray.intersectPlane(planeData.plane, intersection)
+    if (!hit) return null
+
+    return worldToSketch2D(intersection, planeData.origin, planeData.xDir, planeData.yDir)
+  }, [planeData, raycaster, pointer, camera])
+
   /** Create or reuse a point at the given position */
   const getOrCreatePoint = useCallback(
     (pos: { x: number; y: number }): SketchPoint => {
@@ -301,6 +316,9 @@ export function SketchInteraction() {
   // ─── Tool Handlers ──────────────────────────────────────
 
   const handleClick = useCallback((e: any) => {
+    // If a drag-select just completed, suppress this click
+    if (selectDragState.current?.isDragging) return
+
     const sketch = useAppStore.getState().activeSketch
     if (!sketch) return
     const { activeTool, drawingState } = sketch
@@ -486,11 +504,33 @@ export function SketchInteraction() {
   const handlePointerMove = useCallback(() => {
     const sketch = useAppStore.getState().activeSketch
 
-    // Handle drag
+    // Handle point drag
     if (dragState.current?.isDragging) {
       const pos = getSketchPosition()
       if (pos) {
         dragSketchPoint(dragState.current.pointId, pos)
+      }
+      return
+    }
+
+    // Handle selection rectangle drag
+    if (selectDragState.current) {
+      const pos = getRawSketchPosition()
+      if (pos) {
+        const start = selectDragState.current.startPos
+        const dx = pos.x - start.x
+        const dy = pos.y - start.y
+        const dist = Math.sqrt(dx * dx + dy * dy)
+
+        if (dist >= DRAG_SELECT_THRESHOLD) {
+          selectDragState.current.isDragging = true
+          setSelectionRect({
+            startX: start.x,
+            startY: start.y,
+            endX: pos.x,
+            endY: pos.y,
+          })
+        }
       }
       return
     }
@@ -510,7 +550,7 @@ export function SketchInteraction() {
 
     // Drawing mode — update preview position
     setSketchPreviewPosition(pos)
-  }, [getSketchPosition, setSketchPreviewPosition, dragSketchPoint, setSketchHovered])
+  }, [getSketchPosition, getRawSketchPosition, setSketchPreviewPosition, dragSketchPoint, setSketchHovered, setSelectionRect])
 
   const handleContextMenu = useCallback(
     (e: any) => {
@@ -523,10 +563,14 @@ export function SketchInteraction() {
     [resetDrawingState]
   )
 
-  /** Start dragging a point or selecting an entity on pointer down */
-  const handlePointerDown = useCallback(() => {
+  /** Start dragging a point or begin a selection rectangle on pointer down */
+  const handlePointerDown = useCallback((e: any) => {
     const sketch = useAppStore.getState().activeSketch
     if (!sketch || sketch.activeTool) return
+
+    // Only start drag-select on left mouse button
+    const nativeEvent = e?.nativeEvent ?? e
+    if (nativeEvent?.button !== undefined && nativeEvent.button !== 0) return
 
     const pos = getSketchPosition()
     if (!pos) return
@@ -535,15 +579,52 @@ export function SketchInteraction() {
     if (hit && hit.entity.type === 'point') {
       // Start dragging this point
       dragState.current = { pointId: hit.entity.id, isDragging: true }
+    } else if (!hit) {
+      // No entity hit — prepare for potential selection rectangle
+      const rawPos = getRawSketchPosition()
+      if (rawPos) {
+        selectDragState.current = { startPos: rawPos, isDragging: false }
+      }
     }
     // Selection is handled in handleClick (which fires after pointerDown + pointerUp)
-  }, [getSketchPosition])
+  }, [getSketchPosition, getRawSketchPosition])
 
-  const handlePointerUp = useCallback(() => {
+  const handlePointerUp = useCallback((e: any) => {
     if (dragState.current?.isDragging) {
       dragState.current = null
     }
-  }, [])
+
+    if (selectDragState.current?.isDragging) {
+      // Finalize the selection rectangle
+      const sketch = useAppStore.getState().activeSketch
+      if (sketch?.selectionRect) {
+        const { startX, startY, endX, endY } = sketch.selectionRect
+        const isWindow = endX >= startX // left-to-right = window select
+        const rect = normalizeRect(startX, startY, endX, endY)
+        const selected = getEntitiesInRect(rect, isWindow, sketch.entities)
+
+        const nativeEvent = e?.nativeEvent ?? e
+        const additive = !!(nativeEvent?.shiftKey || nativeEvent?.metaKey || nativeEvent?.ctrlKey)
+
+        if (additive) {
+          // Add to existing selection (deduplicate)
+          const combined = new Set([...sketch.selectedEntityIds, ...selected])
+          setSketchSelection(Array.from(combined))
+        } else {
+          setSketchSelection(selected)
+        }
+      }
+
+      setSelectionRect(null)
+      // Keep isDragging true briefly so handleClick is suppressed
+      setTimeout(() => {
+        selectDragState.current = null
+      }, 0)
+      return
+    }
+
+    selectDragState.current = null
+  }, [setSketchSelection, setSelectionRect])
 
   // Build plane transform matrix
   const planeMatrix = useMemo(() => {
@@ -609,4 +690,255 @@ function computeArcFromThreePoints(
   const endAngle = Math.atan2(y3 - uy, x3 - ux)
 
   return { center: { x: ux, y: uy }, radius, startAngle, endAngle }
+}
+
+// ─── Selection Rectangle Helpers ────────────────────────────
+
+interface Rect {
+  minX: number; minY: number; maxX: number; maxY: number
+}
+
+function normalizeRect(
+  startX: number, startY: number, endX: number, endY: number
+): Rect {
+  return {
+    minX: Math.min(startX, endX),
+    minY: Math.min(startY, endY),
+    maxX: Math.max(startX, endX),
+    maxY: Math.max(startY, endY),
+  }
+}
+
+function pointInRect(x: number, y: number, rect: Rect): boolean {
+  return x >= rect.minX && x <= rect.maxX && y >= rect.minY && y <= rect.maxY
+}
+
+/** Check if a line segment intersects or is inside a rectangle */
+function lineIntersectsRect(
+  x1: number, y1: number, x2: number, y2: number, rect: Rect
+): boolean {
+  // If either endpoint is inside, the line intersects
+  if (pointInRect(x1, y1, rect) || pointInRect(x2, y2, rect)) return true
+
+  // Check if the line segment intersects any of the 4 edges of the rectangle
+  const edges: [number, number, number, number][] = [
+    [rect.minX, rect.minY, rect.maxX, rect.minY], // bottom
+    [rect.maxX, rect.minY, rect.maxX, rect.maxY], // right
+    [rect.maxX, rect.maxY, rect.minX, rect.maxY], // top
+    [rect.minX, rect.maxY, rect.minX, rect.minY], // left
+  ]
+
+  for (const [ex1, ey1, ex2, ey2] of edges) {
+    if (segmentsIntersect(x1, y1, x2, y2, ex1, ey1, ex2, ey2)) return true
+  }
+  return false
+}
+
+/** Check if two line segments intersect */
+function segmentsIntersect(
+  ax1: number, ay1: number, ax2: number, ay2: number,
+  bx1: number, by1: number, bx2: number, by2: number
+): boolean {
+  const d1 = cross(bx1, by1, bx2, by2, ax1, ay1)
+  const d2 = cross(bx1, by1, bx2, by2, ax2, ay2)
+  const d3 = cross(ax1, ay1, ax2, ay2, bx1, by1)
+  const d4 = cross(ax1, ay1, ax2, ay2, bx2, by2)
+
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+    return true
+  }
+
+  // Collinear cases
+  if (d1 === 0 && onSegment(bx1, by1, bx2, by2, ax1, ay1)) return true
+  if (d2 === 0 && onSegment(bx1, by1, bx2, by2, ax2, ay2)) return true
+  if (d3 === 0 && onSegment(ax1, ay1, ax2, ay2, bx1, by1)) return true
+  if (d4 === 0 && onSegment(ax1, ay1, ax2, ay2, bx2, by2)) return true
+
+  return false
+}
+
+function cross(
+  ax: number, ay: number, bx: number, by: number, cx: number, cy: number
+): number {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+}
+
+function onSegment(
+  px: number, py: number, qx: number, qy: number, rx: number, ry: number
+): boolean {
+  return (
+    Math.min(px, qx) <= rx && rx <= Math.max(px, qx) &&
+    Math.min(py, qy) <= ry && ry <= Math.max(py, qy)
+  )
+}
+
+/** Check if a circle intersects or is inside a rectangle */
+function circleIntersectsRect(
+  cx: number, cy: number, radius: number, rect: Rect
+): boolean {
+  // Check if center is inside rect
+  if (pointInRect(cx, cy, rect)) return true
+
+  // Check if any edge of the rect intersects the circle
+  const edges: [number, number, number, number][] = [
+    [rect.minX, rect.minY, rect.maxX, rect.minY],
+    [rect.maxX, rect.minY, rect.maxX, rect.maxY],
+    [rect.maxX, rect.maxY, rect.minX, rect.maxY],
+    [rect.minX, rect.maxY, rect.minX, rect.minY],
+  ]
+
+  for (const [ex1, ey1, ex2, ey2] of edges) {
+    if (segmentIntersectsCircle(ex1, ey1, ex2, ey2, cx, cy, radius)) return true
+  }
+  return false
+}
+
+function segmentIntersectsCircle(
+  x1: number, y1: number, x2: number, y2: number,
+  cx: number, cy: number, r: number
+): boolean {
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const fx = x1 - cx
+  const fy = y1 - cy
+
+  const a = dx * dx + dy * dy
+  const b = 2 * (fx * dx + fy * dy)
+  const c = fx * fx + fy * fy - r * r
+
+  let discriminant = b * b - 4 * a * c
+  if (discriminant < 0) return false
+
+  discriminant = Math.sqrt(discriminant)
+  const t1 = (-b - discriminant) / (2 * a)
+  const t2 = (-b + discriminant) / (2 * a)
+
+  return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1)
+}
+
+/** Check if a circle is fully inside a rectangle */
+function circleInsideRect(
+  cx: number, cy: number, radius: number, rect: Rect
+): boolean {
+  return (
+    cx - radius >= rect.minX &&
+    cx + radius <= rect.maxX &&
+    cy - radius >= rect.minY &&
+    cy + radius <= rect.maxY
+  )
+}
+
+/**
+ * Determine which entities are selected by a drag rectangle.
+ * isWindow=true (left-to-right): entities must be fully inside.
+ * isWindow=false (right-to-left): entities that intersect the rect are selected (crossing).
+ */
+function getEntitiesInRect(
+  rect: Rect,
+  isWindow: boolean,
+  entities: Map<string, SketchEntity>
+): string[] {
+  const result: string[] = []
+
+  for (const entity of entities.values()) {
+    switch (entity.type) {
+      case 'point': {
+        if (pointInRect(entity.x, entity.y, rect)) {
+          result.push(entity.id)
+        }
+        break
+      }
+      case 'line': {
+        const startPt = entities.get(entity.startPointId) as SketchPoint | undefined
+        const endPt = entities.get(entity.endPointId) as SketchPoint | undefined
+        if (!startPt || !endPt) break
+
+        if (isWindow) {
+          // Window: both endpoints must be inside
+          if (pointInRect(startPt.x, startPt.y, rect) && pointInRect(endPt.x, endPt.y, rect)) {
+            result.push(entity.id)
+            // Also select the endpoints
+            if (!result.includes(startPt.id)) result.push(startPt.id)
+            if (!result.includes(endPt.id)) result.push(endPt.id)
+          }
+        } else {
+          // Crossing: line intersects or is inside
+          if (lineIntersectsRect(startPt.x, startPt.y, endPt.x, endPt.y, rect)) {
+            result.push(entity.id)
+            if (!result.includes(startPt.id)) result.push(startPt.id)
+            if (!result.includes(endPt.id)) result.push(endPt.id)
+          }
+        }
+        break
+      }
+      case 'circle': {
+        const centerPt = entities.get(entity.centerPointId) as SketchPoint | undefined
+        if (!centerPt) break
+
+        if (isWindow) {
+          if (circleInsideRect(centerPt.x, centerPt.y, entity.radius, rect)) {
+            result.push(entity.id)
+            if (!result.includes(centerPt.id)) result.push(centerPt.id)
+          }
+        } else {
+          if (circleIntersectsRect(centerPt.x, centerPt.y, entity.radius, rect)) {
+            result.push(entity.id)
+            if (!result.includes(centerPt.id)) result.push(centerPt.id)
+          }
+        }
+        break
+      }
+      case 'arc': {
+        const centerPt = entities.get(entity.centerPointId) as SketchPoint | undefined
+        const startPt = entities.get(entity.startPointId) as SketchPoint | undefined
+        const endPt = entities.get(entity.endPointId) as SketchPoint | undefined
+        if (!centerPt || !startPt || !endPt) break
+
+        if (isWindow) {
+          // Window: all associated points and the arc bounding must be inside
+          if (
+            pointInRect(startPt.x, startPt.y, rect) &&
+            pointInRect(endPt.x, endPt.y, rect) &&
+            pointInRect(centerPt.x, centerPt.y, rect)
+          ) {
+            result.push(entity.id)
+            if (!result.includes(centerPt.id)) result.push(centerPt.id)
+            if (!result.includes(startPt.id)) result.push(startPt.id)
+            if (!result.includes(endPt.id)) result.push(endPt.id)
+          }
+        } else {
+          // Crossing: check if any arc point is inside or arc crosses rect edges
+          // Approximate arc as a polyline for crossing check
+          const segments = 32
+          let arcStart = entity.startAngle
+          let arcEnd = entity.endAngle
+          if (arcEnd < arcStart) arcEnd += 2 * Math.PI
+
+          let intersects = false
+          for (let i = 0; i < segments && !intersects; i++) {
+            const t1 = arcStart + (arcEnd - arcStart) * (i / segments)
+            const t2 = arcStart + (arcEnd - arcStart) * ((i + 1) / segments)
+            const ax = centerPt.x + entity.radius * Math.cos(t1)
+            const ay = centerPt.y + entity.radius * Math.sin(t1)
+            const bx = centerPt.x + entity.radius * Math.cos(t2)
+            const by = centerPt.y + entity.radius * Math.sin(t2)
+            if (lineIntersectsRect(ax, ay, bx, by, rect)) {
+              intersects = true
+            }
+          }
+
+          if (intersects) {
+            result.push(entity.id)
+            if (!result.includes(centerPt.id)) result.push(centerPt.id)
+            if (!result.includes(startPt.id)) result.push(startPt.id)
+            if (!result.includes(endPt.id)) result.push(endPt.id)
+          }
+        }
+        break
+      }
+    }
+  }
+
+  return result
 }

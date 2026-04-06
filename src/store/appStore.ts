@@ -7,6 +7,7 @@ import {
   type SketchTool,
   type SketchConstraint,
   type ConstraintTool,
+  type SelectionRect,
   createEmptySketch,
   generateEntityId,
 } from '../engine/sketchTypes'
@@ -106,6 +107,8 @@ export interface AppState {
   setSketchPreviewPosition: (pos: { x: number; y: number } | null) => void
   addDrawingPoint: (pointId: string) => void
   resetDrawingState: () => void
+  /** Set or clear the drag-to-select rectangle */
+  setSelectionRect: (rect: SelectionRect | null) => void
   /** Generate a unique entity ID and increment the counter */
   generateId: (prefix: string) => string
 
@@ -359,6 +362,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         placedPointIds: [],
         previewPosition: null,
       },
+      selectionRect: null,
       nextEntityId,
     }
 
@@ -589,6 +593,17 @@ export const useAppStore = create<AppState>((set, get) => ({
           placedPointIds: [],
           previewPosition: null,
         },
+      },
+    })
+  },
+
+  setSelectionRect: (rect) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+    set({
+      activeSketch: {
+        ...sketch,
+        selectionRect: rect,
       },
     })
   },

@@ -48,6 +48,7 @@ function snapshotToSketchState(sketch: SketchFeature): SketchState {
     activeTool: null,
     activeConstraintTool: null,
     drawingState: { tool: null, placedPointIds: [], previewPosition: null },
+    selectionRect: null,
     nextEntityId: 0,
   }
 }

@@ -26,6 +26,9 @@ const PREVIEW_COLOR = '#4488ff'
 
 const CIRCLE_SEGMENTS = 64
 
+const ORIGIN_COLOR = '#888888'
+const ORIGIN_LENGTH = 2 // units in each direction from origin
+
 // ─── Helpers ────────────────────────────────────────────────
 
 /** Convert 2D sketch coords to 3D using the sketch plane transform */
@@ -587,6 +590,135 @@ function getConstraintDisplayInfo(
   }
 }
 
+// ─── Sketch Origin ──────────────────────────────────────────
+
+function SketchOrigin({
+  to3D,
+}: {
+  to3D: (x: number, y: number) => THREE.Vector3
+}) {
+  const xAxisPoints = useMemo(
+    () => [to3D(-ORIGIN_LENGTH, 0), to3D(ORIGIN_LENGTH, 0)],
+    [to3D]
+  )
+  const yAxisPoints = useMemo(
+    () => [to3D(0, -ORIGIN_LENGTH), to3D(0, ORIGIN_LENGTH)],
+    [to3D]
+  )
+  const originPos = useMemo(() => to3D(0, 0), [to3D])
+
+  return (
+    <>
+      <Line
+        points={xAxisPoints}
+        color={ORIGIN_COLOR}
+        lineWidth={1}
+        dashed
+        dashSize={0.15}
+        gapSize={0.1}
+        opacity={0.5}
+        transparent
+      />
+      <Line
+        points={yAxisPoints}
+        color={ORIGIN_COLOR}
+        lineWidth={1}
+        dashed
+        dashSize={0.15}
+        gapSize={0.1}
+        opacity={0.5}
+        transparent
+      />
+      <mesh position={originPos}>
+        <sphereGeometry args={[0.08, 12, 12]} />
+        <meshBasicMaterial color={ORIGIN_COLOR} opacity={0.6} transparent />
+      </mesh>
+    </>
+  )
+}
+
+// ─── Selection Rectangle ────────────────────────────────────
+
+const WINDOW_SELECT_COLOR = '#4488ff'  // blue for left-to-right (window select)
+const CROSSING_SELECT_COLOR = '#44cc44' // green for right-to-left (crossing select)
+
+function SelectionRectangle({
+  to3D,
+}: {
+  to3D: (x: number, y: number) => THREE.Vector3
+}) {
+  const selectionRect = useAppStore((s) => s.activeSketch?.selectionRect)
+
+  const { borderPoints, fillMatrix, fillScale, color } = useMemo(() => {
+    if (!selectionRect) return { borderPoints: null, fillMatrix: null, fillScale: null, color: WINDOW_SELECT_COLOR }
+
+    const { startX, startY, endX, endY } = selectionRect
+    const isWindow = endX >= startX
+
+    const c = isWindow ? WINDOW_SELECT_COLOR : CROSSING_SELECT_COLOR
+
+    // 4 corners for the border
+    const p1 = to3D(startX, startY)
+    const p2 = to3D(endX, startY)
+    const p3 = to3D(endX, endY)
+    const p4 = to3D(startX, endY)
+
+    // Center and scale for the fill plane
+    const cx = (startX + endX) / 2
+    const cy = (startY + endY) / 2
+    const w = Math.abs(endX - startX)
+    const h = Math.abs(endY - startY)
+
+    const center = to3D(cx, cy)
+    // Build a matrix for the fill mesh: position it at center on the sketch plane
+    const xDir = to3D(1, 0).sub(to3D(0, 0)).normalize()
+    const yDir = to3D(0, 1).sub(to3D(0, 0)).normalize()
+    const normal = new THREE.Vector3().crossVectors(xDir, yDir).normalize()
+    const m = new THREE.Matrix4()
+    m.makeBasis(xDir, yDir, normal)
+    m.setPosition(center)
+
+    return {
+      borderPoints: [p1, p2, p3, p4, p1],
+      fillMatrix: m,
+      fillScale: [w, h, 1] as [number, number, number],
+      color: c,
+    }
+  }, [selectionRect, to3D])
+
+  if (!selectionRect || !borderPoints || !fillMatrix || !fillScale) return null
+
+  return (
+    <>
+      <Line
+        points={borderPoints}
+        color={color}
+        lineWidth={1.5}
+        dashed
+        dashSize={0.2}
+        gapSize={0.1}
+        depthWrite={false}
+        renderOrder={999}
+      />
+      <mesh
+        matrixAutoUpdate={false}
+        matrix={fillMatrix}
+        scale={fillScale}
+        renderOrder={998}
+      >
+        <planeGeometry args={[1, 1]} />
+        <meshBasicMaterial
+          color={color}
+          transparent
+          opacity={0.08}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+    </>
+  )
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 export function SketchRenderer() {
@@ -607,6 +739,7 @@ export function SketchRenderer() {
   return (
     <>
       <SketchPlaneVisual />
+      <SketchOrigin to3D={transform.to3D} />
 
       {Array.from(entities.values()).map((entity) => {
         const isSelected = selectedEntityIds.includes(entity.id)
@@ -667,6 +800,7 @@ export function SketchRenderer() {
 
       <DrawingPreview to3D={transform.to3D} />
       <ConstraintRenderer to3D={transform.to3D} />
+      <SelectionRectangle to3D={transform.to3D} />
     </>
   )
 }
