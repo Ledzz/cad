@@ -1,13 +1,17 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useRef } from 'react'
 import { useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { useAppStore } from '../store/appStore'
-import type { SketchPoint, SketchEntity } from '../engine/sketchTypes'
+import type {
+  SketchPoint,
+  SketchEntity,
+} from '../engine/sketchTypes'
 
 // ─── Constants ──────────────────────────────────────────────
 
 const SNAP_DISTANCE = 0.5 // world units
 const GRID_SNAP_SIZE = 1.0
+const ENTITY_HIT_THRESHOLD = 0.4 // how close a click must be to select an entity
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -80,6 +84,136 @@ function findExistingPoint(
   return null
 }
 
+// ─── Geometric Hit Testing ──────────────────────────────────
+
+/** Distance from a point to a line segment */
+function distToLineSegment(
+  px: number, py: number,
+  x1: number, y1: number,
+  x2: number, y2: number
+): number {
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const lenSq = dx * dx + dy * dy
+  if (lenSq < 1e-12) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+
+  // Project point onto line, clamped to [0, 1]
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+
+  const projX = x1 + t * dx
+  const projY = y1 + t * dy
+  return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2)
+}
+
+/** Distance from a point to a circle outline */
+function distToCircle(
+  px: number, py: number,
+  cx: number, cy: number,
+  radius: number
+): number {
+  const distToCenter = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+  return Math.abs(distToCenter - radius)
+}
+
+/** Distance from a point to an arc outline */
+function distToArc(
+  px: number, py: number,
+  cx: number, cy: number,
+  radius: number,
+  startAngle: number,
+  endAngle: number
+): number {
+  const distToCenter = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+  const angle = Math.atan2(py - cy, px - cx)
+
+  // Normalize angles to check if the point's angle falls within the arc's sweep
+  let sa = startAngle
+  let ea = endAngle
+  if (ea < sa) ea += Math.PI * 2
+
+  let a = angle
+  // Normalize a into the same range
+  while (a < sa) a += Math.PI * 2
+  while (a > sa + Math.PI * 2) a -= Math.PI * 2
+
+  if (a >= sa && a <= ea) {
+    // Point angle is within the arc — distance is |dist_to_center - radius|
+    return Math.abs(distToCenter - radius)
+  }
+
+  // Outside the arc's angle range — distance to the nearest endpoint
+  const startX = cx + Math.cos(startAngle) * radius
+  const startY = cy + Math.sin(startAngle) * radius
+  const endX = cx + Math.cos(endAngle) * radius
+  const endY = cy + Math.sin(endAngle) * radius
+
+  const dStart = Math.sqrt((px - startX) ** 2 + (py - startY) ** 2)
+  const dEnd = Math.sqrt((px - endX) ** 2 + (py - endY) ** 2)
+  return Math.min(dStart, dEnd)
+}
+
+/**
+ * Find the nearest sketch entity to a 2D position.
+ * Returns the entity and its distance, or null if nothing is within threshold.
+ * Points are given slight priority (smaller effective threshold) since they're smaller targets.
+ */
+function findNearestEntity(
+  pos: { x: number; y: number },
+  entities: Map<string, SketchEntity>,
+  threshold: number
+): { entity: SketchEntity; distance: number } | null {
+  let bestEntity: SketchEntity | null = null
+  let bestDist = threshold
+
+  for (const entity of entities.values()) {
+    let dist: number
+
+    switch (entity.type) {
+      case 'point': {
+        dist = Math.sqrt((pos.x - entity.x) ** 2 + (pos.y - entity.y) ** 2)
+        // Give points a slight priority boost (0.8x distance) so they win over lines they sit on
+        dist *= 0.8
+        break
+      }
+      case 'line': {
+        const startPt = entities.get(entity.startPointId) as SketchPoint | undefined
+        const endPt = entities.get(entity.endPointId) as SketchPoint | undefined
+        if (!startPt || !endPt) continue
+        dist = distToLineSegment(pos.x, pos.y, startPt.x, startPt.y, endPt.x, endPt.y)
+        break
+      }
+      case 'circle': {
+        const center = entities.get(entity.centerPointId) as SketchPoint | undefined
+        if (!center) continue
+        dist = distToCircle(pos.x, pos.y, center.x, center.y, entity.radius)
+        break
+      }
+      case 'arc': {
+        const center = entities.get(entity.centerPointId) as SketchPoint | undefined
+        if (!center) continue
+        dist = distToArc(
+          pos.x, pos.y,
+          center.x, center.y,
+          entity.radius,
+          entity.startAngle,
+          entity.endAngle
+        )
+        break
+      }
+      default:
+        continue
+    }
+
+    if (dist < bestDist) {
+      bestDist = dist
+      bestEntity = entity
+    }
+  }
+
+  return bestEntity ? { entity: bestEntity, distance: bestDist } : null
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 /**
@@ -94,7 +228,16 @@ export function SketchInteraction() {
   const addDrawingPoint = useAppStore((s) => s.addDrawingPoint)
   const resetDrawingState = useAppStore((s) => s.resetDrawingState)
   const generateId = useAppStore((s) => s.generateId)
+  const dragSketchPoint = useAppStore((s) => s.dragSketchPoint)
+  const setSketchSelection = useAppStore((s) => s.setSketchSelection)
+  const setSketchHovered = useAppStore((s) => s.setSketchHovered)
   const { raycaster, camera, pointer } = useThree()
+
+  // Track drag state
+  const dragState = useRef<{
+    pointId: string
+    isDragging: boolean
+  } | null>(null)
 
   // Build sketch plane geometry (for raycasting)
   const planeData = useMemo(() => {
@@ -157,13 +300,35 @@ export function SketchInteraction() {
 
   // ─── Tool Handlers ──────────────────────────────────────
 
-  const handleClick = useCallback(() => {
+  const handleClick = useCallback((e: any) => {
     const sketch = useAppStore.getState().activeSketch
     if (!sketch) return
     const { activeTool, drawingState } = sketch
 
     if (!activeTool) {
-      // Selection mode — handled by entity click events in SketchRenderer
+      // Selection mode — find the nearest entity via geometric hit-testing
+      const pos = getSketchPosition()
+      if (!pos) return
+
+      const hit = findNearestEntity(pos, sketch.entities, ENTITY_HIT_THRESHOLD)
+      if (hit) {
+        const nativeEvent = e?.nativeEvent ?? e
+        const multiSelect = !!(nativeEvent?.shiftKey || nativeEvent?.metaKey || nativeEvent?.ctrlKey)
+        if (multiSelect) {
+          // Toggle: add/remove from current selection
+          const current = sketch.selectedEntityIds
+          if (current.includes(hit.entity.id)) {
+            setSketchSelection(current.filter((id: string) => id !== hit.entity.id))
+          } else {
+            setSketchSelection([...current, hit.entity.id])
+          }
+        } else {
+          setSketchSelection([hit.entity.id])
+        }
+      } else {
+        // Clicked empty space — deselect all
+        setSketchSelection([])
+      }
       return
     }
 
@@ -320,11 +485,32 @@ export function SketchInteraction() {
 
   const handlePointerMove = useCallback(() => {
     const sketch = useAppStore.getState().activeSketch
-    if (!sketch?.activeTool) return
+
+    // Handle drag
+    if (dragState.current?.isDragging) {
+      const pos = getSketchPosition()
+      if (pos) {
+        dragSketchPoint(dragState.current.pointId, pos)
+      }
+      return
+    }
 
     const pos = getSketchPosition()
+
+    if (!sketch?.activeTool) {
+      // Selection mode — update hover highlight
+      if (pos && sketch) {
+        const hit = findNearestEntity(pos, sketch.entities, ENTITY_HIT_THRESHOLD)
+        setSketchHovered(hit ? hit.entity.id : null)
+      } else {
+        setSketchHovered(null)
+      }
+      return
+    }
+
+    // Drawing mode — update preview position
     setSketchPreviewPosition(pos)
-  }, [getSketchPosition, setSketchPreviewPosition])
+  }, [getSketchPosition, setSketchPreviewPosition, dragSketchPoint, setSketchHovered])
 
   const handleContextMenu = useCallback(
     (e: any) => {
@@ -336,6 +522,28 @@ export function SketchInteraction() {
     },
     [resetDrawingState]
   )
+
+  /** Start dragging a point or selecting an entity on pointer down */
+  const handlePointerDown = useCallback(() => {
+    const sketch = useAppStore.getState().activeSketch
+    if (!sketch || sketch.activeTool) return
+
+    const pos = getSketchPosition()
+    if (!pos) return
+
+    const hit = findNearestEntity(pos, sketch.entities, ENTITY_HIT_THRESHOLD)
+    if (hit && hit.entity.type === 'point') {
+      // Start dragging this point
+      dragState.current = { pointId: hit.entity.id, isDragging: true }
+    }
+    // Selection is handled in handleClick (which fires after pointerDown + pointerUp)
+  }, [getSketchPosition])
+
+  const handlePointerUp = useCallback(() => {
+    if (dragState.current?.isDragging) {
+      dragState.current = null
+    }
+  }, [])
 
   // Build plane transform matrix
   const planeMatrix = useMemo(() => {
@@ -353,6 +561,8 @@ export function SketchInteraction() {
       matrixAutoUpdate={false}
       matrix={planeMatrix}
       onClick={handleClick}
+      onPointerDown={handlePointerDown}
+      onPointerUp={handlePointerUp}
       onPointerMove={handlePointerMove}
       onContextMenu={handleContextMenu}
       renderOrder={-1}

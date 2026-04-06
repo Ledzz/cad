@@ -36,9 +36,17 @@ function snapshotToSketchState(sketch: SketchFeature): SketchState {
     id: sketch.id,
     plane: sketch.sketch.plane,
     entities,
+    constraints: sketch.sketch.constraints ?? [],
+    constraintStatus: {
+      dof: 0,
+      isOverConstrained: false,
+      isSolved: true,
+      conflictingConstraintIds: [],
+    },
     selectedEntityIds: [],
     hoveredEntityId: null,
     activeTool: null,
+    activeConstraintTool: null,
     drawingState: { tool: null, placedPointIds: [], previewPosition: null },
     nextEntityId: 0,
   }

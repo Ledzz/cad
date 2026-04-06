@@ -92,6 +92,166 @@ export interface SketchArc {
 
 export type SketchEntity = SketchPoint | SketchLine | SketchCircle | SketchArc
 
+// ─── Constraints ────────────────────────────────────────────
+
+/** Constraint that makes two points coincide */
+export interface CoincidentConstraint {
+  type: 'coincident'
+  id: string
+  pointId1: string
+  pointId2: string
+}
+
+/** Constraint that makes a line (or two points) horizontal (same Y) */
+export interface HorizontalConstraint {
+  type: 'horizontal'
+  id: string
+  /** Either a line ID or two point IDs */
+  entityId?: string
+  pointId1?: string
+  pointId2?: string
+}
+
+/** Constraint that makes a line (or two points) vertical (same X) */
+export interface VerticalConstraint {
+  type: 'vertical'
+  id: string
+  entityId?: string
+  pointId1?: string
+  pointId2?: string
+}
+
+/** Constraint that fixes a point at specific coordinates */
+export interface FixedConstraint {
+  type: 'fixed'
+  id: string
+  pointId: string
+  x: number
+  y: number
+}
+
+/** Constraint that sets the distance between two points (or length of a line) */
+export interface DistanceConstraint {
+  type: 'distance'
+  id: string
+  pointId1: string
+  pointId2: string
+  value: number
+}
+
+/** Constraint that sets the horizontal distance between two points */
+export interface HorizontalDistanceConstraint {
+  type: 'horizontalDistance'
+  id: string
+  pointId1: string
+  pointId2: string
+  value: number
+}
+
+/** Constraint that sets the vertical distance between two points */
+export interface VerticalDistanceConstraint {
+  type: 'verticalDistance'
+  id: string
+  pointId1: string
+  pointId2: string
+  value: number
+}
+
+/** Constraint that sets the angle between two lines */
+export interface AngleConstraint {
+  type: 'angle'
+  id: string
+  lineId1: string
+  lineId2: string
+  /** Angle in degrees */
+  value: number
+}
+
+/** Constraint that makes two lines perpendicular */
+export interface PerpendicularConstraint {
+  type: 'perpendicular'
+  id: string
+  lineId1: string
+  lineId2: string
+}
+
+/** Constraint that makes two lines parallel */
+export interface ParallelConstraint {
+  type: 'parallel'
+  id: string
+  lineId1: string
+  lineId2: string
+}
+
+/** Constraint that makes two lines/circles have equal length/radius */
+export interface EqualConstraint {
+  type: 'equal'
+  id: string
+  entityId1: string
+  entityId2: string
+}
+
+/** Constraint that sets the radius of a circle or arc */
+export interface RadiusConstraint {
+  type: 'radius'
+  id: string
+  entityId: string
+  value: number
+}
+
+/** Constraint that makes a line tangent to a circle/arc */
+export interface TangentConstraint {
+  type: 'tangent'
+  id: string
+  entityId1: string
+  entityId2: string
+}
+
+/** Constraint that places a point at the midpoint of a line */
+export interface MidpointConstraint {
+  type: 'midpoint'
+  id: string
+  pointId: string
+  lineId: string
+}
+
+/** Constraint that makes a point lie on a line or circle */
+export interface PointOnEntityConstraint {
+  type: 'pointOnEntity'
+  id: string
+  pointId: string
+  entityId: string
+}
+
+export type SketchConstraint =
+  | CoincidentConstraint
+  | HorizontalConstraint
+  | VerticalConstraint
+  | FixedConstraint
+  | DistanceConstraint
+  | HorizontalDistanceConstraint
+  | VerticalDistanceConstraint
+  | AngleConstraint
+  | PerpendicularConstraint
+  | ParallelConstraint
+  | EqualConstraint
+  | RadiusConstraint
+  | TangentConstraint
+  | MidpointConstraint
+  | PointOnEntityConstraint
+
+/** Constraint status for the sketch */
+export interface ConstraintStatus {
+  /** Degrees of freedom remaining (0 = fully constrained) */
+  dof: number
+  /** Whether the sketch is over-constrained */
+  isOverConstrained: boolean
+  /** Whether the solver converged successfully */
+  isSolved: boolean
+  /** IDs of conflicting constraints (if over-constrained) */
+  conflictingConstraintIds: string[]
+}
+
 // ─── Drawing Tools ──────────────────────────────────────────
 
 export type SketchTool = 'line' | 'circle' | 'arc' | 'rectangle' | 'point' | null
@@ -117,16 +277,41 @@ export type SnapTarget =
 
 // ─── Full Sketch State ─────────────────────────────────────
 
+/** Active constraint tool */
+export type ConstraintTool =
+  | 'coincident'
+  | 'horizontal'
+  | 'vertical'
+  | 'fixed'
+  | 'distance'
+  | 'horizontalDistance'
+  | 'verticalDistance'
+  | 'angle'
+  | 'perpendicular'
+  | 'parallel'
+  | 'equal'
+  | 'radius'
+  | 'tangent'
+  | 'midpoint'
+  | 'pointOnEntity'
+  | null
+
 export interface SketchState {
   id: string
   plane: SketchPlane
   entities: Map<string, SketchEntity>
+  /** Constraints applied to the sketch */
+  constraints: SketchConstraint[]
+  /** Current constraint solver status */
+  constraintStatus: ConstraintStatus
   /** Currently selected entity IDs */
   selectedEntityIds: string[]
   /** Currently hovered entity ID */
   hoveredEntityId: string | null
   /** Active drawing tool */
   activeTool: SketchTool
+  /** Active constraint tool */
+  activeConstraintTool: ConstraintTool
   /** Current drawing operation state */
   drawingState: DrawingState
   /** Next entity ID counter */
@@ -138,9 +323,17 @@ export function createEmptySketch(id: string, plane: SketchPlane): SketchState {
     id,
     plane,
     entities: new Map(),
+    constraints: [],
+    constraintStatus: {
+      dof: 0,
+      isOverConstrained: false,
+      isSolved: true,
+      conflictingConstraintIds: [],
+    },
     selectedEntityIds: [],
     hoveredEntityId: null,
     activeTool: null,
+    activeConstraintTool: null,
     drawingState: {
       tool: null,
       placedPointIds: [],

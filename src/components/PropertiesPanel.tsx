@@ -1,6 +1,65 @@
 import { useAppStore } from '../store/appStore'
 import { featureTypeLabel, getEditableParams } from '../engine/featureTypes'
 
+/** Labels for constraint types */
+const CONSTRAINT_TYPE_LABELS: Record<string, string> = {
+  coincident: 'Coincident',
+  horizontal: 'Horizontal',
+  vertical: 'Vertical',
+  fixed: 'Fixed',
+  distance: 'Distance',
+  horizontalDistance: 'Horizontal Distance',
+  verticalDistance: 'Vertical Distance',
+  angle: 'Angle',
+  perpendicular: 'Perpendicular',
+  parallel: 'Parallel',
+  equal: 'Equal',
+  radius: 'Radius',
+  tangent: 'Tangent',
+  midpoint: 'Midpoint',
+  pointOnEntity: 'Point on Entity',
+}
+
+function SketchConstraintPanel() {
+  const activeSketch = useAppStore((s) => s.activeSketch)
+  const removeConstraints = useAppStore((s) => s.removeConstraints)
+
+  if (!activeSketch || activeSketch.constraints.length === 0) return null
+
+  return (
+    <div className="px-3 py-2 text-sm border-t border-[#2a2a4a]">
+      <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
+        Constraints ({activeSketch.constraints.length})
+      </div>
+      <div className="space-y-1 max-h-[200px] overflow-y-auto">
+        {activeSketch.constraints.map((c) => (
+          <div
+            key={c.id}
+            className="text-xs text-gray-400 flex items-center justify-between group"
+          >
+            <span>
+              {CONSTRAINT_TYPE_LABELS[c.type] ?? c.type}
+              {'value' in c && (c as any).value !== undefined && (
+                <span className="text-gray-500 ml-1">
+                  = {Math.round((c as any).value * 100) / 100}
+                  {c.type === 'angle' ? '\u00B0' : ''}
+                </span>
+              )}
+            </span>
+            <button
+              className="text-red-400 hover:text-red-300 opacity-0 group-hover:opacity-100 transition-opacity text-[10px]"
+              onClick={() => removeConstraints([c.id])}
+              title="Remove constraint"
+            >
+              X
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function PropertiesPanel() {
   const selection = useAppStore((s) => s.selection)
   const sceneObjects = useAppStore((s) => s.sceneObjects)
@@ -91,13 +150,14 @@ export function PropertiesPanel() {
                         </span>
                       </div>
                     </div>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-        )}
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       </div>
+      <SketchConstraintPanel />
     </div>
   )
 }

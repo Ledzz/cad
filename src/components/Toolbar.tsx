@@ -1,12 +1,17 @@
 import { useState } from 'react'
 import { useAppStore } from '../store/appStore'
 import { SKETCH_PLANES } from '../engine/sketchTypes'
+import type { SketchConstraint } from '../engine/sketchTypes'
 import {
   generateFeatureId,
   snapshotSketch,
   type SketchFeature,
   type ExtrudeFeature,
 } from '../engine/featureTypes'
+import {
+  getApplicableConstraints,
+  createConstraintFromSelection,
+} from '../engine/constraintSolver'
 
 const buttonBase =
   'px-2 py-1 text-xs rounded transition-colors cursor-pointer select-none'
@@ -26,15 +31,62 @@ export function Toolbar() {
   const confirmSketchEdit = useAppStore((s) => s.confirmSketchEdit)
   const setActiveSketchTool = useAppStore((s) => s.setActiveSketchTool)
   const addFeatures = useAppStore((s) => s.addFeatures)
+  const addConstraint = useAppStore((s) => s.addConstraint)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
   const undo = useAppStore((s) => s.undo)
   const redo = useAppStore((s) => s.redo)
   const canUndo = useAppStore((s) => s.canUndo)
   const canRedo = useAppStore((s) => s.canRedo)
+  const generateId = useAppStore((s) => s.generateId)
   const [extruding, setExtruding] = useState(false)
 
   const activeTool = activeSketch?.activeTool ?? null
   const isEditingExisting = editingSketchFeatureId !== null
+  const selectedIds = activeSketch?.selectedEntityIds ?? []
+  const entities = activeSketch?.entities ?? new Map()
+
+  // Determine which constraints can be applied to the current selection
+  const applicable = selectedIds.length > 0
+    ? getApplicableConstraints(selectedIds, entities)
+    : []
+
+  const handleApplyConstraint = (constraintType: SketchConstraint['type']) => {
+    if (!activeSketch) return
+
+    // For dimensional constraints, prompt for value
+    const needsValue = ['distance', 'horizontalDistance', 'verticalDistance', 'angle', 'radius'].includes(constraintType)
+    let value: number | undefined
+
+    if (needsValue) {
+      // Create with measured value first, then let user edit
+      const constraint = createConstraintFromSelection(
+        constraintType,
+        generateId('cst'),
+        selectedIds,
+        entities
+      )
+      if (constraint && 'value' in constraint) {
+        const label = constraintType === 'angle' ? 'Angle (degrees)' : 'Value'
+        const defaultVal = Math.round((constraint as any).value * 1000) / 1000
+        const input = prompt(`${label}:`, String(defaultVal))
+        if (input === null) return
+        value = parseFloat(input)
+        if (isNaN(value)) return
+      }
+    }
+
+    const constraint = createConstraintFromSelection(
+      constraintType,
+      generateId('cst'),
+      selectedIds,
+      entities,
+      value
+    )
+
+    if (constraint) {
+      addConstraint(constraint)
+    }
+  }
 
   const handleFinishAndExtrude = async () => {
     if (!activeSketch) return
@@ -60,7 +112,7 @@ export function Toolbar() {
       if (isEditingExisting) {
         // Updating existing sketch + keeping/creating extrude
         // First save the sketch edits
-        const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities)
+        const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints)
         const { updateFeature } = useAppStore.getState()
         await updateFeature(editingSketchFeatureId, { sketch: snapshot } as Partial<SketchFeature>)
 
@@ -73,7 +125,7 @@ export function Toolbar() {
           name: `Sketch (${activeSketch.plane.name})`,
           type: 'sketch',
           suppressed: false,
-          sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+          sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
         }
 
         // Create an ExtrudeFeature referencing the sketch
@@ -204,6 +256,33 @@ export function Toolbar() {
 
           <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
 
+          {/* Constraint tools — only show when entities are selected */}
+          <ConstraintButtons
+            applicable={applicable}
+            onApply={handleApplyConstraint}
+          />
+
+          {applicable.length > 0 && <div className="w-px h-5 bg-[#2a2a4a] mx-1" />}
+
+          {/* DOF indicator */}
+          {activeSketch && activeSketch.constraints.length > 0 && (
+            <span className={`text-xs ${
+              activeSketch.constraintStatus.isOverConstrained
+                ? 'text-red-400'
+                : activeSketch.constraintStatus.dof === 0
+                  ? 'text-green-400'
+                  : 'text-blue-400'
+            }`}>
+              {activeSketch.constraintStatus.isOverConstrained
+                ? 'Over-constrained'
+                : activeSketch.constraintStatus.dof === 0
+                  ? 'Fully constrained'
+                  : `DOF: ${activeSketch.constraintStatus.dof}`}
+            </span>
+          )}
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
           <button
             className={`${buttonBase} text-purple-400 hover:text-purple-300 hover:bg-purple-900/30`}
             onClick={handleFinishAndExtrude}
@@ -227,5 +306,69 @@ export function Toolbar() {
         </>
       )}
     </div>
+  )
+}
+
+// ─── Constraint Button Labels ───────────────────────────────
+
+const CONSTRAINT_LABELS: Record<SketchConstraint['type'], { label: string; title: string }> = {
+  coincident: { label: 'Co', title: 'Coincident — merge two points' },
+  horizontal: { label: 'H', title: 'Horizontal — make line/points horizontal' },
+  vertical: { label: 'V', title: 'Vertical — make line/points vertical' },
+  fixed: { label: 'Fix', title: 'Fixed — lock point position' },
+  distance: { label: 'D', title: 'Distance — set distance/length' },
+  horizontalDistance: { label: 'DH', title: 'Horizontal Distance' },
+  verticalDistance: { label: 'DV', title: 'Vertical Distance' },
+  angle: { label: 'Ang', title: 'Angle between two lines' },
+  perpendicular: { label: '⊥', title: 'Perpendicular — make lines 90°' },
+  parallel: { label: '∥', title: 'Parallel — make lines parallel' },
+  equal: { label: '=', title: 'Equal — make lengths/radii equal' },
+  radius: { label: 'R', title: 'Radius — set circle/arc radius' },
+  tangent: { label: 'T', title: 'Tangent' },
+  midpoint: { label: 'Mid', title: 'Midpoint — place point at line center' },
+  pointOnEntity: { label: 'On', title: 'Point on Entity — constrain point to line/circle' },
+}
+
+const constraintButton =
+  `${buttonBase} text-cyan-400 hover:text-cyan-300 hover:bg-cyan-900/30`
+const constraintButtonDisabled =
+  `${buttonBase} text-gray-600 cursor-not-allowed`
+
+function ConstraintButtons({
+  applicable,
+  onApply,
+}: {
+  applicable: SketchConstraint['type'][]
+  onApply: (type: SketchConstraint['type']) => void
+}) {
+  // Show a curated set of constraint buttons; enable only the applicable ones
+  const allConstraints: SketchConstraint['type'][] = [
+    'coincident', 'horizontal', 'vertical', 'fixed',
+    'distance', 'perpendicular', 'parallel', 'equal',
+    'radius', 'tangent', 'midpoint',
+  ]
+
+  const applicableSet = new Set(applicable)
+
+  // Only show buttons that have a chance of being applicable (i.e., if there's a selection)
+  // To keep the toolbar clean, show all buttons but dim the inapplicable ones
+  return (
+    <>
+      {allConstraints.map((type) => {
+        const info = CONSTRAINT_LABELS[type]
+        const enabled = applicableSet.has(type)
+        return (
+          <button
+            key={type}
+            className={enabled ? constraintButton : constraintButtonDisabled}
+            onClick={() => enabled && onApply(type)}
+            disabled={!enabled}
+            title={info.title}
+          >
+            {info.label}
+          </button>
+        )
+      })}
+    </>
   )
 }

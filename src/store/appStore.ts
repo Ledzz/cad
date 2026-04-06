@@ -5,12 +5,15 @@ import {
   type SketchPlane,
   type SketchEntity,
   type SketchTool,
+  type SketchConstraint,
+  type ConstraintTool,
   createEmptySketch,
   generateEntityId,
 } from '../engine/sketchTypes'
 import type { Feature, SketchFeature } from '../engine/featureTypes'
 import { generateFeatureId, restoreSketchEntities, snapshotSketch } from '../engine/featureTypes'
 import { rebuildAll } from '../engine/rebuild'
+import { solveConstraints, getConstraintReferencedIds } from '../engine/constraintSolver'
 
 // ─── Selection ──────────────────────────────────────────────
 
@@ -105,6 +108,16 @@ export interface AppState {
   resetDrawingState: () => void
   /** Generate a unique entity ID and increment the counter */
   generateId: (prefix: string) => string
+
+  // ─── Constraints ────────────────────────────────────────
+  addConstraint: (constraint: SketchConstraint) => void
+  removeConstraints: (ids: string[]) => void
+  updateConstraintValue: (id: string, value: number) => void
+  setActiveConstraintTool: (tool: ConstraintTool) => void
+  /** Run the constraint solver and update point positions */
+  runSolver: (draggedPointId?: string, dragPosition?: { x: number; y: number }) => void
+  /** Drag a sketch point (used during interactive drag) */
+  dragSketchPoint: (pointId: string, position: { x: number; y: number }) => void
 }
 
 // ─── Sketch ID counter ─────────────────────────────────────
@@ -323,16 +336,24 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!feature || feature.type !== 'sketch') return
 
     const sketchFeature = feature as SketchFeature
-    const entities = restoreSketchEntities(sketchFeature.sketch)
+    const { entities, constraints } = restoreSketchEntities(sketchFeature.sketch)
     const nextEntityId = computeNextEntityId(entities)
 
     const sketch: SketchState = {
       id: sketchFeature.id,
       plane: sketchFeature.sketch.plane,
       entities,
+      constraints,
+      constraintStatus: {
+        dof: 0,
+        isOverConstrained: false,
+        isSolved: true,
+        conflictingConstraintIds: [],
+      },
       selectedEntityIds: [],
       hoveredEntityId: null,
       activeTool: null,
+      activeConstraintTool: null,
       drawingState: {
         tool: null,
         placedPointIds: [],
@@ -363,7 +384,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     if (editingSketchFeatureId) {
       // Updating an existing sketch feature
-      const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities)
+      const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints)
       // Use updateFeature which pushes history and rebuilds
       set({
         mode: 'modeling',
@@ -379,7 +400,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         name: `Sketch (${activeSketch.plane.name})`,
         type: 'sketch',
         suppressed: false,
-        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities),
+        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
       }
       set({
         mode: 'modeling',
@@ -397,6 +418,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeSketch: {
         ...sketch,
         activeTool: tool,
+        activeConstraintTool: null,
         drawingState: {
           tool,
           placedPointIds: [],
@@ -468,10 +490,24 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
 
+    // Also remove constraints that reference deleted entities
+    const deletedEntityIds = new Set<string>()
+    for (const id of idsSet) deletedEntityIds.add(id)
+    // Add cascade-deleted entity IDs
+    for (const id of sketch.entities.keys()) {
+      if (!newEntities.has(id)) deletedEntityIds.add(id)
+    }
+
+    const newConstraints = sketch.constraints.filter((c) => {
+      const refs = getConstraintReferencedIds(c, newEntities)
+      return refs.every((refId) => !deletedEntityIds.has(refId))
+    })
+
     set({
       activeSketch: {
         ...sketch,
         entities: newEntities,
+        constraints: newConstraints,
         selectedEntityIds: sketch.selectedEntityIds.filter((id) => !idsSet.has(id)),
       },
     })
@@ -569,5 +605,130 @@ export const useAppStore = create<AppState>((set, get) => ({
       },
     })
     return id
+  },
+
+  // ─── Constraints ─────────────────────────────────────────
+
+  addConstraint: (constraint) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+    const newConstraints = [...sketch.constraints, constraint]
+    set({
+      activeSketch: {
+        ...sketch,
+        constraints: newConstraints,
+      },
+    })
+    // Run solver after adding constraint
+    get().runSolver()
+  },
+
+  removeConstraints: (ids) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+    const idsSet = new Set(ids)
+    const newConstraints = sketch.constraints.filter((c) => !idsSet.has(c.id))
+    set({
+      activeSketch: {
+        ...sketch,
+        constraints: newConstraints,
+      },
+    })
+    // Run solver after removing constraint
+    get().runSolver()
+  },
+
+  updateConstraintValue: (id, value) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+    const newConstraints = sketch.constraints.map((c) =>
+      c.id === id ? { ...c, value } as SketchConstraint : c
+    )
+    set({
+      activeSketch: {
+        ...sketch,
+        constraints: newConstraints,
+      },
+    })
+    // Run solver after updating value
+    get().runSolver()
+  },
+
+  setActiveConstraintTool: (tool) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+    set({
+      activeSketch: {
+        ...sketch,
+        activeConstraintTool: tool,
+        // Clear drawing tool when switching to constraint mode
+        activeTool: tool ? null : sketch.activeTool,
+        drawingState: tool ? {
+          tool: null,
+          placedPointIds: [],
+          previewPosition: null,
+        } : sketch.drawingState,
+      },
+    })
+  },
+
+  runSolver: (draggedPointId, dragPosition) => {
+    const sketch = get().activeSketch
+    if (!sketch || sketch.constraints.length === 0) return
+
+    const result = solveConstraints(
+      sketch.entities,
+      sketch.constraints,
+      draggedPointId,
+      dragPosition
+    )
+
+    // Apply point updates
+    if (result.pointUpdates.size > 0) {
+      const newEntities = new Map(sketch.entities)
+      for (const [pointId, pos] of result.pointUpdates) {
+        const pt = newEntities.get(pointId)
+        if (pt && pt.type === 'point') {
+          newEntities.set(pointId, { ...pt, x: pos.x, y: pos.y })
+        }
+      }
+      set({
+        activeSketch: {
+          ...get().activeSketch!,
+          entities: newEntities,
+          constraintStatus: result.status,
+        },
+      })
+    } else {
+      set({
+        activeSketch: {
+          ...get().activeSketch!,
+          constraintStatus: result.status,
+        },
+      })
+    }
+  },
+
+  dragSketchPoint: (pointId, position) => {
+    const sketch = get().activeSketch
+    if (!sketch) return
+
+    // Update the point position
+    const newEntities = new Map(sketch.entities)
+    const pt = newEntities.get(pointId)
+    if (!pt || pt.type !== 'point') return
+    newEntities.set(pointId, { ...pt, x: position.x, y: position.y })
+
+    set({
+      activeSketch: {
+        ...sketch,
+        entities: newEntities,
+      },
+    })
+
+    // Run solver with this point as the dragged/fixed point
+    if (sketch.constraints.length > 0) {
+      get().runSolver(pointId, position)
+    }
   },
 }))

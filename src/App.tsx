@@ -5,6 +5,59 @@ import { Viewport } from './components/Viewport'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { FeatureEditDialog } from './components/FeatureEditDialog'
 import { useAppStore } from './store/appStore'
+import {
+  getApplicableConstraints,
+  createConstraintFromSelection,
+} from './engine/constraintSolver'
+
+import type { SketchConstraint } from './engine/sketchTypes'
+import type { AppState } from './store/appStore'
+
+/** Try to apply a constraint to the current selection via keyboard shortcut */
+function applyConstraintShortcut(store: AppState, constraintType: SketchConstraint['type']) {
+  const sketch = store.activeSketch
+  if (!sketch) return
+
+  const { selectedEntityIds, entities } = sketch
+  if (selectedEntityIds.length === 0) return
+
+  const applicable = getApplicableConstraints(selectedEntityIds, entities)
+  if (!applicable.includes(constraintType)) return
+
+  // For dimensional constraints, prompt for value
+  const needsValue = ['distance', 'horizontalDistance', 'verticalDistance', 'angle', 'radius'].includes(constraintType)
+  let value: number | undefined
+
+  if (needsValue) {
+    const tempConstraint = createConstraintFromSelection(
+      constraintType,
+      'temp',
+      selectedEntityIds,
+      entities
+    )
+    if (tempConstraint && 'value' in tempConstraint) {
+      const label = constraintType === 'angle' ? 'Angle (degrees)' : 'Value'
+      const defaultVal = Math.round((tempConstraint as any).value * 1000) / 1000
+      const input = prompt(`${label}:`, String(defaultVal))
+      if (input === null) return
+      value = parseFloat(input)
+      if (isNaN(value)) return
+    }
+  }
+
+  const id = store.generateId('cst')
+  const constraint = createConstraintFromSelection(
+    constraintType,
+    id,
+    selectedEntityIds,
+    entities,
+    value
+  )
+
+  if (constraint) {
+    store.addConstraint(constraint)
+  }
+}
 
 function useSketchKeyboardShortcuts() {
   const mode = useAppStore((s) => s.mode)
@@ -17,12 +70,15 @@ function useSketchKeyboardShortcuts() {
       switch (e.key) {
         case 'Escape': {
           // If drawing, cancel the current drawing operation
+          // If constraint tool active, clear it
           // If no drawing in progress, deselect or exit sketch
-          const { drawingState, activeTool } = store.activeSketch
+          const { drawingState, activeTool, activeConstraintTool } = store.activeSketch
           if (drawingState.placedPointIds.length > 0) {
             store.resetDrawingState()
           } else if (activeTool) {
             store.setActiveSketchTool(null)
+          } else if (activeConstraintTool) {
+            store.setActiveConstraintTool(null)
           }
           break
         }
@@ -64,6 +120,50 @@ function useSketchKeyboardShortcuts() {
         case 'P':
           if (!e.metaKey && !e.ctrlKey) {
             store.setActiveSketchTool(store.activeSketch.activeTool === 'point' ? null : 'point')
+          }
+          break
+
+        // ─── Constraint shortcuts ─────────────────────────
+        case 'h':
+        case 'H':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'horizontal')
+          }
+          break
+        case 'v':
+        case 'V':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'vertical')
+          }
+          break
+        case 'd':
+        case 'D':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'distance')
+          }
+          break
+        case 'e':
+        case 'E':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'equal')
+          }
+          break
+        case 'f':
+        case 'F':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'fixed')
+          }
+          break
+        case 'q':
+        case 'Q':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'perpendicular')
+          }
+          break
+        case 't':
+        case 'T':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'tangent')
           }
           break
       }

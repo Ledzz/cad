@@ -6,7 +6,7 @@
  * regenerates all downstream geometry.
  */
 
-import type { SketchPlane, SketchEntity } from './sketchTypes'
+import type { SketchPlane, SketchEntity, SketchConstraint } from './sketchTypes'
 
 // ─── Base ───────────────────────────────────────────────────
 
@@ -53,6 +53,7 @@ export interface SphereFeature extends BaseFeature {
 export interface SketchSnapshot {
   plane: SketchPlane
   entities: SerializedSketchEntity[]
+  constraints: SketchConstraint[]
 }
 
 /** A sketch entity stored as a plain object (no Map) for serialization. */
@@ -106,11 +107,13 @@ export function resetFeatureCounter(): void {
  */
 export function snapshotSketch(
   plane: SketchPlane,
-  entities: Map<string, SketchEntity>
+  entities: Map<string, SketchEntity>,
+  constraints: SketchConstraint[] = []
 ): SketchSnapshot {
   return {
     plane,
     entities: Array.from(entities.values()),
+    constraints: [...constraints],
   }
 }
 
@@ -119,12 +122,15 @@ export function snapshotSketch(
  */
 export function restoreSketchEntities(
   snapshot: SketchSnapshot
-): Map<string, SketchEntity> {
+): { entities: Map<string, SketchEntity>; constraints: SketchConstraint[] } {
   const map = new Map<string, SketchEntity>()
   for (const entity of snapshot.entities) {
     map.set(entity.id, entity)
   }
-  return map
+  return {
+    entities: map,
+    constraints: snapshot.constraints ? [...snapshot.constraints] : [],
+  }
 }
 
 /**
