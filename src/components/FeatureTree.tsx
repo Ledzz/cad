@@ -21,6 +21,8 @@ function FeatureIcon({ feature }: { feature: Feature }) {
     label = 'Fi'; color = 'bg-blue-600'
   } else if (feature.type === 'chamfer') {
     label = 'Ch'; color = 'bg-indigo-600'
+  } else if (feature.type === 'referencePlane') {
+    label = 'Pl'; color = 'bg-green-600'
   } else {
     label = '?'; color = 'bg-gray-600'
   }
@@ -86,7 +88,7 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
   const openFeaturePanelEdit = useAppStore((s) => s.openFeaturePanelEdit)
   const editSketch = useAppStore((s) => s.editSketch)
 
-  const hasEditableParams = feature.type === 'extrude' || feature.type === 'revolve' || feature.type === 'fillet' || feature.type === 'chamfer'
+  const hasEditableParams = feature.type === 'extrude' || feature.type === 'revolve' || feature.type === 'fillet' || feature.type === 'chamfer' || feature.type === 'referencePlane'
   const isSketch = feature.type === 'sketch'
 
   useEffect(() => {
@@ -247,7 +249,7 @@ export function FeatureTree() {
                     // Double-click sketch to edit it
                     editSketch(feature.id)
                   } else {
-                    // For other features, open parameter edit dialog
+                    // For other features (including referencePlane), open parameter edit dialog
                     openFeaturePanelEdit(feature.id)
                   }
                 }}

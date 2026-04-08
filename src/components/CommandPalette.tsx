@@ -77,6 +77,25 @@ function buildCommands(): CadCommand[] {
       URL.revokeObjectURL(url)
     },
   })
+  commands.push({
+    id: 'file:export-3mf',
+    label: 'Export 3MF',
+    group: 'File',
+    keywords: ['3mf', 'export', '3d print', 'manufacturing'],
+    available: () => useAppStore.getState().sceneObjects.size > 0,
+    action: async () => {
+      const { getOccApi } = await import('../workers/occApi')
+      const api = await getOccApi()
+      const data = await api.export3MF()
+      const blob = new Blob([new Uint8Array(data)], { type: 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'export.3mf'
+      a.click()
+      URL.revokeObjectURL(url)
+    },
+  })
 
   // ─── Edit ─────────────────────────────────────────────
   commands.push({
@@ -288,6 +307,19 @@ function buildCommands(): CadCommand[] {
       return s.mode === 'modeling' && s.sceneObjects.size > 0
     },
     action: () => useAppStore.getState().startEdgeSelection('chamfer'),
+  })
+  commands.push({
+    id: 'feature:ref-plane',
+    label: 'Reference Plane',
+    group: 'Features',
+    keywords: ['reference', 'plane', 'construction', 'offset', 'angle'],
+    available: () => useAppStore.getState().mode === 'modeling',
+    action: async () => {
+      const store = useAppStore.getState()
+      const id = generateFeatureId('refplane')
+      const feature = createDefaultFeature('referencePlane', id)
+      await store.openFeaturePanelCreate(feature)
+    },
   })
 
   // ─── View ─────────────────────────────────────────────

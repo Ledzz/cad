@@ -12,7 +12,7 @@ import {
   generateEntityId,
 } from '../engine/sketchTypes'
 import type { Feature, SketchFeature } from '../engine/featureTypes'
-import { generateFeatureId, restoreSketchEntities, snapshotSketch, type CreatableFeatureType, createDefaultFeature } from '../engine/featureTypes'
+import { generateFeatureId, restoreSketchEntities, snapshotSketch } from '../engine/featureTypes'
 import { rebuildAll } from '../engine/rebuild'
 import { solveConstraints, getConstraintReferencedIds } from '../engine/constraintSolver'
 
@@ -129,6 +129,12 @@ export interface AppState {
   setHoveredFace: (face: HoveredFace | null) => void
   /** Called when user clicks a face during face selection mode */
   selectFaceForSketch: (featureId: string, faceIndex: number) => Promise<void>
+
+  // Face selection mode (for "up-to-face" extrude)
+  selectingExtrudeFace: boolean
+  startExtrudeFaceSelection: () => void
+  cancelExtrudeFaceSelection: () => void
+  selectFaceForExtrude: (featureId: string, faceIndex: number) => void
 
   // ─── Edge Selection Mode ────────────────────────────────
   edgeSelection: EdgeSelectionState | null
@@ -258,6 +264,9 @@ function generateFeatureName(feature: Feature): string {
   switch (feature.type) {
     case 'extrude': {
       const label = feature.operation === 'cut' ? 'Cut' : 'Extrude'
+      const mode = feature.mode ?? 'blind'
+      if (mode === 'throughAll') return `${label} (Through All)`
+      if (mode === 'upToFace') return `${label} (Up to Face)`
       return `${label} (${feature.distance}mm)`
     }
     case 'revolve':
@@ -266,6 +275,12 @@ function generateFeatureName(feature: Feature): string {
       return `Fillet (r${feature.radius})`
     case 'chamfer':
       return `Chamfer (d${feature.distance})`
+    case 'referencePlane': {
+      if (feature.method.type === 'offset') {
+        return `Ref Plane (${feature.method.basePlaneId} +${feature.method.distance})`
+      }
+      return `Ref Plane (${feature.method.basePlaneId} ${feature.method.angle}°)`
+    }
     default:
       return feature.name
   }
@@ -389,6 +404,53 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.error('[Store] Failed to get face plane:', err)
       set({ selectingSketchFace: false, hoveredFace: null })
     }
+  },
+
+  // ─── Extrude Face Selection Mode ────────────────────────
+
+  selectingExtrudeFace: false,
+
+  startExtrudeFaceSelection: () => {
+    set({
+      selectingExtrudeFace: true,
+      hoveredFace: null,
+      selection: { selectedIds: [], hoveredId: null },
+    })
+  },
+
+  cancelExtrudeFaceSelection: () => {
+    set({
+      selectingExtrudeFace: false,
+      hoveredFace: null,
+    })
+  },
+
+  selectFaceForExtrude: (featureId, faceIndex) => {
+    const panel = get().featurePanel
+    if (!panel || panel.feature.type !== 'extrude') {
+      set({ selectingExtrudeFace: false, hoveredFace: null })
+      return
+    }
+
+    const extrudeFeature = panel.feature as import('../engine/featureTypes').ExtrudeFeature
+    const updatedFeature: Feature = {
+      ...extrudeFeature,
+      targetFaceRef: { shapeId: featureId, faceIndex },
+    }
+
+    const features = get().features.map((f) =>
+      f.id === updatedFeature.id ? updatedFeature : f
+    )
+
+    set({
+      selectingExtrudeFace: false,
+      hoveredFace: null,
+      featurePanel: { ...panel, feature: updatedFeature },
+      features,
+    })
+
+    // Trigger rebuild
+    performRebuild(features, set)
   },
 
   // ─── Edge Selection Mode ────────────────────────────────
@@ -636,7 +698,41 @@ export const useAppStore = create<AppState>((set, get) => ({
     const panel = get().featurePanel
     if (!panel) return
 
-    const updatedFeature = { ...panel.feature, [key]: value } as Feature
+    let updatedFeature: Feature
+
+    if (panel.feature.type === 'referencePlane') {
+      // Handle reference plane nested method params
+      const f = panel.feature as import('../engine/featureTypes').ReferencePlaneFeature
+      if (key === 'methodType') {
+        // Switching method type — reset to defaults
+        const method = value === 'offset'
+          ? { type: 'offset' as const, basePlaneId: f.method.basePlaneId, distance: 10 }
+          : { type: 'angle' as const, basePlaneId: f.method.basePlaneId, angle: 45, axisIndex: 0 as const }
+        updatedFeature = { ...f, method } as Feature
+      } else if (key === 'basePlaneId') {
+        updatedFeature = { ...f, method: { ...f.method, basePlaneId: value as string } } as Feature
+      } else if (key === 'distance' && f.method.type === 'offset') {
+        updatedFeature = { ...f, method: { ...f.method, distance: value as number } } as Feature
+      } else if (key === 'angle' && f.method.type === 'angle') {
+        updatedFeature = { ...f, method: { ...f.method, angle: value as number } } as Feature
+      } else if (key === 'axisIndex' && f.method.type === 'angle') {
+        updatedFeature = { ...f, method: { ...f.method, axisIndex: Number(value) as 0 | 1 } } as Feature
+      } else {
+        updatedFeature = { ...f, [key]: value } as Feature
+      }
+    } else if (panel.feature.type === 'extrude' && key === 'mode') {
+      // Switching extrude mode — reset direction if needed
+      const f = panel.feature as import('../engine/featureTypes').ExtrudeFeature
+      const newMode = value as import('../engine/featureTypes').ExtrudeMode
+      let direction = f.direction
+      if (newMode !== 'blind' && direction === 'symmetric') {
+        direction = 'normal' // symmetric not available for non-blind modes
+      }
+      updatedFeature = { ...f, mode: newMode, direction } as Feature
+    } else {
+      updatedFeature = { ...panel.feature, [key]: value } as Feature
+    }
+
     // Update the feature in the features list and rebuild
     const features = get().features.map((f) =>
       f.id === updatedFeature.id ? updatedFeature : f

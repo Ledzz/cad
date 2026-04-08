@@ -62,5 +62,16 @@ function validateProjectFile(data: unknown): Feature[] {
     throw new Error('Invalid project file: features must be an array')
   }
 
-  return obj.features as Feature[]
+  // Migrate old features that may be missing newer fields
+  const features = obj.features as Feature[]
+  for (const f of features) {
+    if (f.type === 'extrude') {
+      // Extrude mode was added later — default to 'blind' for backward compatibility
+      if (!('mode' in f) || !(f as any).mode) {
+        (f as any).mode = 'blind'
+      }
+    }
+  }
+
+  return features
 }

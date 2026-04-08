@@ -3,7 +3,7 @@ import * as THREE from 'three'
 import { Line } from '@react-three/drei'
 import { useAppStore } from '../store/appStore'
 import type { FaceRange } from '../engine/tessellation'
-import type { MeasurementPicking } from '../store/appStore'
+import type { ReferencePlaneFeature } from '../engine/featureTypes'
 
 const OBJECT_COLOR = '#6688cc'
 const HOVER_COLOR = '#88aaee'
@@ -182,6 +182,75 @@ function BRepEdgeOverlay({ geometry }: { geometry: THREE.BufferGeometry }) {
  * In sketch mode, objects are dimmed with transparency.
  * In face selection mode, individual faces can be hovered and clicked.
  */
+const REF_PLANE_SIZE = 15
+const REF_PLANE_COLOR = '#44aa77'
+const REF_PLANE_OPACITY = 0.15
+const REF_PLANE_EDGE_COLOR = '#44aa77'
+
+/**
+ * Renders reference plane visuals as translucent rectangles in the viewport.
+ */
+function ReferencePlaneVisuals() {
+  const features = useAppStore((s) => s.features)
+  const mode = useAppStore((s) => s.mode)
+  const selection = useAppStore((s) => s.selection)
+
+  const refPlanes = features.filter(
+    (f): f is ReferencePlaneFeature => f.type === 'referencePlane' && !f.suppressed
+  )
+
+  if (refPlanes.length === 0 || mode === 'sketching') return null
+
+  return (
+    <>
+      {refPlanes.map((rp) => {
+        const isSelected = selection.selectedIds.includes(rp.id)
+        const { origin, xDir, yDir } = rp.plane
+        const half = REF_PLANE_SIZE / 2
+
+        // Build a rotation matrix from the plane's local axes
+        const matrix = new THREE.Matrix4()
+        const normal = new THREE.Vector3(...rp.plane.normal)
+        const x = new THREE.Vector3(...xDir)
+        const y = new THREE.Vector3(...yDir)
+        matrix.makeBasis(x, y, normal)
+        matrix.setPosition(origin[0], origin[1], origin[2])
+
+        // Build border lines in local space
+        const corners: [number, number, number][] = [
+          [origin[0] - x.x * half - y.x * half, origin[1] - x.y * half - y.y * half, origin[2] - x.z * half - y.z * half],
+          [origin[0] + x.x * half - y.x * half, origin[1] + x.y * half - y.y * half, origin[2] + x.z * half - y.z * half],
+          [origin[0] + x.x * half + y.x * half, origin[1] + x.y * half + y.y * half, origin[2] + x.z * half + y.z * half],
+          [origin[0] - x.x * half + y.x * half, origin[1] - x.y * half + y.y * half, origin[2] - x.z * half + y.z * half],
+          [origin[0] - x.x * half - y.x * half, origin[1] - x.y * half - y.y * half, origin[2] - x.z * half - y.z * half],
+        ]
+
+        return (
+          <group key={rp.id}>
+            <mesh matrixAutoUpdate={false} matrix={matrix}>
+              <planeGeometry args={[REF_PLANE_SIZE, REF_PLANE_SIZE]} />
+              <meshBasicMaterial
+                color={isSelected ? '#66ccaa' : REF_PLANE_COLOR}
+                transparent
+                opacity={isSelected ? 0.25 : REF_PLANE_OPACITY}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            <Line
+              points={corners}
+              color={isSelected ? '#88eebb' : REF_PLANE_EDGE_COLOR}
+              lineWidth={isSelected ? 1.5 : 1}
+              transparent
+              opacity={0.5}
+            />
+          </group>
+        )
+      })}
+    </>
+  )
+}
+
 export function SceneObjects() {
   const sceneObjects = useAppStore((s) => s.sceneObjects)
   const selection = useAppStore((s) => s.selection)
@@ -189,9 +258,11 @@ export function SceneObjects() {
   const setSelection = useAppStore((s) => s.setSelection)
   const mode = useAppStore((s) => s.mode)
   const selectingSketchFace = useAppStore((s) => s.selectingSketchFace)
+  const selectingExtrudeFace = useAppStore((s) => s.selectingExtrudeFace)
   const hoveredFace = useAppStore((s) => s.hoveredFace)
   const setHoveredFace = useAppStore((s) => s.setHoveredFace)
   const selectFaceForSketch = useAppStore((s) => s.selectFaceForSketch)
+  const selectFaceForExtrude = useAppStore((s) => s.selectFaceForExtrude)
   const edgeSelection = useAppStore((s) => s.edgeSelection)
   const showEdges = useAppStore((s) => s.showEdges)
   const measurementMode = useAppStore((s) => s.measurementMode)
@@ -201,7 +272,7 @@ export function SceneObjects() {
   const setMeasurementMode = useAppStore((s) => s.setMeasurementMode)
 
   const isSketchMode = mode === 'sketching'
-  const isFaceSelectionMode = selectingSketchFace && !isSketchMode
+  const isFaceSelectionMode = (selectingSketchFace || selectingExtrudeFace) && !isSketchMode
   const isEdgeSelectionMode = edgeSelection?.active ?? false
   const isMeasurementMode = measurementMode !== null && !isSketchMode
 
@@ -381,7 +452,11 @@ export function SceneObjects() {
                   if (faceRanges && e.faceIndex != null) {
                     const face = findFaceFromTriIndex(e.faceIndex, faceRanges)
                     if (face) {
-                      selectFaceForSketch(id, face.faceIndex)
+                      if (selectingExtrudeFace) {
+                        selectFaceForExtrude(id, face.faceIndex)
+                      } else {
+                        selectFaceForSketch(id, face.faceIndex)
+                      }
                     }
                   }
                 } else {
@@ -421,6 +496,8 @@ export function SceneObjects() {
       })}
       {/* Edge selection overlay */}
       <EdgeSelectionOverlay />
+      {/* Reference plane visuals */}
+      <ReferencePlaneVisuals />
     </>
   )
 }

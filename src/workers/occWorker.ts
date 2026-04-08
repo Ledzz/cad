@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as Comlink from 'comlink'
+import { zipSync } from 'fflate'
 import type { OpenCascadeInstance } from '../wasm/opencascade'
 import type { TopoDSShape, TopoDSShell, TopoDSWire, BRepAlgoAPI_Fuse, TopToolsListOfShape, EmscriptenFS } from '../engine/occTypes'
 import type { TessellationData, FaceRange } from '../engine/tessellation'
@@ -1429,6 +1430,207 @@ const occWorkerApi = {
       }
     } finally {
       mesh.delete()
+    }
+  },
+
+  /**
+   * Export the final solid as a 3MF file (ZIP containing XML mesh data).
+   * Returns the file contents as a Uint8Array.
+   */
+  export3MF(): Uint8Array {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = getLastShape()
+    if (!shape) throw new Error('No shape to export')
+
+    // Tessellate the shape
+    const tess = tessellateShape(shape, '__3mf_export__')
+
+    // Build vertex list as XML
+    const vertexCount = tess.vertices.length / 3
+    const vertexLines: string[] = []
+    for (let i = 0; i < vertexCount; i++) {
+      const x = tess.vertices[i * 3]
+      const y = tess.vertices[i * 3 + 1]
+      const z = tess.vertices[i * 3 + 2]
+      vertexLines.push(`          <vertex x="${x}" y="${y}" z="${z}" />`)
+    }
+
+    // Build triangle list as XML
+    const triCount = tess.indices.length / 3
+    const triLines: string[] = []
+    for (let i = 0; i < triCount; i++) {
+      const v1 = tess.indices[i * 3]
+      const v2 = tess.indices[i * 3 + 1]
+      const v3 = tess.indices[i * 3 + 2]
+      triLines.push(`          <triangle v1="${v1}" v2="${v2}" v3="${v3}" />`)
+    }
+
+    // 3D model XML
+    const model = `<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <object id="1" type="model">
+      <mesh>
+        <vertices>
+${vertexLines.join('\n')}
+        </vertices>
+        <triangles>
+${triLines.join('\n')}
+        </triangles>
+      </mesh>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1" />
+  </build>
+</model>`
+
+    // Content types XML
+    const contentTypes = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
+  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
+</Types>`
+
+    // Relationships XML
+    const rels = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />
+</Relationships>`
+
+    const encoder = new TextEncoder()
+    const zipData = zipSync({
+      '[Content_Types].xml': encoder.encode(contentTypes),
+      '_rels/.rels': encoder.encode(rels),
+      '3D/3dmodel.model': encoder.encode(model),
+    })
+
+    return Comlink.transfer(zipData, [zipData.buffer])
+  },
+
+  /**
+   * Get the bounding box diagonal of a shape in the registry.
+   * Used for "through-all" extrude to determine a safe extrude distance.
+   */
+  getShapeBoundingBox(shapeId: string): { diagonal: number; min: [number, number, number]; max: [number, number, number] } {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    const box = new oc.Bnd_Box_1()
+    try {
+      oc.BRepBndLib.Add(shape, box, false)
+      const min = box.CornerMin()
+      const max = box.CornerMax()
+      const minPt: [number, number, number] = [min.X(), min.Y(), min.Z()]
+      const maxPt: [number, number, number] = [max.X(), max.Y(), max.Z()]
+      const dx = maxPt[0] - minPt[0]
+      const dy = maxPt[1] - minPt[1]
+      const dz = maxPt[2] - minPt[2]
+      const diagonal = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      min.delete()
+      max.delete()
+      return { diagonal, min: minPt, max: maxPt }
+    } finally {
+      box.delete()
+    }
+  },
+
+  /**
+   * Compute the distance from a point to a planar face along a given direction.
+   * Used for "up-to-face" extrude mode.
+   * Returns the signed distance, or null if the face is non-planar or direction is parallel to face.
+   */
+  distanceToFace(
+    shapeId: string,
+    faceIndex: number,
+    origin: [number, number, number],
+    direction: [number, number, number]
+  ): number | null {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    // Find the face at the given index
+    const explorer = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_FACE as any,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE as any
+    )
+
+    let currentIndex = 0
+    let targetFace: any = null
+
+    while (explorer.More()) {
+      if (currentIndex === faceIndex) {
+        targetFace = oc.TopoDS.Face_1(explorer.Current())
+        break
+      }
+      currentIndex++
+      explorer.Next()
+    }
+    explorer.delete()
+
+    if (!targetFace) return null
+
+    try {
+      // Get surface adaptor to check planarity
+      const adaptor = new oc.BRepAdaptor_Surface_2(targetFace, true)
+      try {
+        const surfType = adaptor.GetType()
+        if (surfType !== (oc.GeomAbs_SurfaceType as any).GeomAbs_Plane) {
+          return null // Non-planar face
+        }
+
+        const pln = adaptor.Plane()
+        const pos = pln.Position()
+        const loc = pos.Location()
+        const dir = pos.Direction()
+
+        // Face point and normal
+        const facePoint = [loc.X(), loc.Y(), loc.Z()] as [number, number, number]
+        const faceNormal = [dir.X(), dir.Y(), dir.Z()] as [number, number, number]
+
+        // Handle reversed face
+        if (targetFace.IsEqual) {
+          const orient = targetFace.Orientation_1()
+          if (orient === (oc.TopAbs_Orientation as any).TopAbs_REVERSED) {
+            faceNormal[0] = -faceNormal[0]
+            faceNormal[1] = -faceNormal[1]
+            faceNormal[2] = -faceNormal[2]
+          }
+        }
+
+        loc.delete()
+        dir.delete()
+        pos.delete()
+        pln.delete()
+
+        // Compute distance from origin to the face plane along the extrude direction.
+        // Plane equation: dot(faceNormal, P - facePoint) = 0
+        // Ray: P = origin + t * direction
+        // dot(faceNormal, origin + t * direction - facePoint) = 0
+        // t = dot(faceNormal, facePoint - origin) / dot(faceNormal, direction)
+
+        const dDotN = direction[0] * faceNormal[0] + direction[1] * faceNormal[1] + direction[2] * faceNormal[2]
+        if (Math.abs(dDotN) < 1e-10) return null // Direction parallel to face
+
+        const diff = [
+          facePoint[0] - origin[0],
+          facePoint[1] - origin[1],
+          facePoint[2] - origin[2],
+        ]
+        const t = (diff[0] * faceNormal[0] + diff[1] * faceNormal[1] + diff[2] * faceNormal[2]) / dDotN
+
+        return t // Signed distance along direction
+      } finally {
+        adaptor.delete()
+      }
+    } finally {
+      targetFace.delete()
     }
   },
 }

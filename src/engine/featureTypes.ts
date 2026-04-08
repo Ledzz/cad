@@ -48,16 +48,29 @@ export type ExtrudeDirection = 'normal' | 'reverse' | 'symmetric'
 /** 'boss' = add material; 'cut' = remove material from the previous solid */
 export type ExtrudeOperation = 'boss' | 'cut'
 
+/** Extrude depth mode: blind (fixed distance), throughAll, or upToFace */
+export type ExtrudeMode = 'blind' | 'throughAll' | 'upToFace'
+
+/** Reference to a specific face on a shape (for up-to-face extrude) */
+export interface FaceRef {
+  shapeId: string
+  faceIndex: number
+}
+
 export interface ExtrudeFeature extends BaseFeature {
   type: 'extrude'
   /** ID of the SketchFeature this extrude is based on */
   sketchId: string
-  /** Extrude distance (always positive; direction is separate) */
+  /** Extrude distance (always positive; direction is separate). Used for 'blind' mode. */
   distance: number
   /** Which direction to extrude relative to the sketch plane normal */
   direction: ExtrudeDirection
   /** Whether to add or subtract material. Defaults to 'boss'. */
   operation: ExtrudeOperation
+  /** Depth mode. Defaults to 'blind' for backward compatibility. */
+  mode: ExtrudeMode
+  /** Target face for 'upToFace' mode */
+  targetFaceRef?: FaceRef
 }
 
 // ─── Revolve Feature ────────────────────────────────────────
@@ -95,6 +108,21 @@ export interface ChamferFeature extends BaseFeature {
   edgeIndices?: number[]
 }
 
+// ─── Reference Plane Feature ────────────────────────────────
+
+/** How a reference plane is constructed */
+export type ReferencePlaneMethod =
+  | { type: 'offset'; basePlaneId: string; distance: number }
+  | { type: 'angle'; basePlaneId: string; angle: number; axisIndex: 0 | 1 }
+
+export interface ReferencePlaneFeature extends BaseFeature {
+  type: 'referencePlane'
+  /** Construction method and parameters */
+  method: ReferencePlaneMethod
+  /** The computed sketch plane (derived from method during rebuild) */
+  plane: SketchPlane
+}
+
 // ─── Union ──────────────────────────────────────────────────
 
 export type Feature =
@@ -103,6 +131,7 @@ export type Feature =
   | RevolveFeature
   | FilletFeature
   | ChamferFeature
+  | ReferencePlaneFeature
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -160,6 +189,7 @@ export function featureTypeLabel(type: Feature['type']): string {
     case 'revolve': return 'Revolve'
     case 'fillet': return 'Fillet'
     case 'chamfer': return 'Chamfer'
+    case 'referencePlane': return 'Ref Plane'
     default: return 'Feature'
   }
 }
@@ -178,10 +208,15 @@ export function featureDisplayLabel(feature: Feature): string {
  */
 export function getEditableParams(feature: Feature): Record<string, { label: string; value: number; min?: number; max?: number; step?: number }> {
   switch (feature.type) {
-    case 'extrude':
-      return {
-        distance: { label: 'Distance', value: feature.distance, min: 0.01, step: 0.5 },
+    case 'extrude': {
+      const mode = feature.mode ?? 'blind'
+      if (mode === 'blind') {
+        return {
+          distance: { label: 'Distance', value: feature.distance, min: 0.01, step: 0.5 },
+        }
       }
+      return {}
+    }
     case 'revolve':
       return {
         angle: { label: 'Angle (°)', value: feature.angle, min: 1, max: 360, step: 1 },
@@ -194,6 +229,12 @@ export function getEditableParams(feature: Feature): Record<string, { label: str
       return {
         distance: { label: 'Distance', value: feature.distance, min: 0.01, step: 0.1 },
       }
+    case 'referencePlane': {
+      if (feature.method.type === 'offset') {
+        return { distance: { label: 'Offset', value: feature.method.distance, step: 0.5 } }
+      }
+      return { angle: { label: 'Angle (°)', value: feature.method.angle, min: -360, max: 360, step: 1 } }
+    }
     case 'sketch':
       return {}
     default:
@@ -220,27 +261,64 @@ export interface SelectParamDef {
   options: { value: string; label: string }[]
 }
 
-export type ParamDef = NumberParamDef | SelectParamDef
+export interface ButtonParamDef {
+  type: 'button'
+  label: string
+  key: string
+  /** Button text label */
+  buttonLabel: string
+  /** Status text shown next to the button (e.g. "Face selected" or "No face") */
+  statusText?: string
+}
+
+export type ParamDef = NumberParamDef | SelectParamDef | ButtonParamDef
 
 /**
  * Get ALL editable parameters for a feature, including selects.
  * Used by the unified FeaturePanel for both creation and editing.
+ * @param feature The feature to get params for
+ * @param allFeatures Optional full features list (used to populate reference plane options)
  */
-export function getFullEditableParams(feature: Feature): ParamDef[] {
+export function getFullEditableParams(feature: Feature, allFeatures?: Feature[]): ParamDef[] {
   switch (feature.type) {
-    case 'extrude':
-      return [
-        { type: 'number', key: 'distance', label: 'Distance', value: feature.distance, min: 0.01 },
+    case 'extrude': {
+      const mode = feature.mode ?? 'blind'
+      const params: ParamDef[] = [
+        { type: 'select', key: 'mode', label: 'Mode', value: mode, options: [
+          { value: 'blind', label: 'Blind (Distance)' },
+          { value: 'throughAll', label: 'Through All' },
+          { value: 'upToFace', label: 'Up to Face' },
+        ]},
+      ]
+      if (mode === 'blind') {
+        params.push(
+          { type: 'number', key: 'distance', label: 'Distance', value: feature.distance, min: 0.01 },
+        )
+      }
+      if (mode === 'upToFace') {
+        params.push({
+          type: 'button',
+          key: 'selectFace',
+          label: 'Target Face',
+          buttonLabel: feature.targetFaceRef ? 'Change Face' : 'Select Face',
+          statusText: feature.targetFaceRef
+            ? `Face ${feature.targetFaceRef.faceIndex} on ${feature.targetFaceRef.shapeId}`
+            : 'No face selected',
+        })
+      }
+      params.push(
         { type: 'select', key: 'direction', label: 'Direction', value: feature.direction, options: [
           { value: 'normal', label: 'Normal' },
           { value: 'reverse', label: 'Reverse' },
-          { value: 'symmetric', label: 'Symmetric' },
+          ...(mode === 'blind' ? [{ value: 'symmetric', label: 'Symmetric' }] : []),
         ]},
         { type: 'select', key: 'operation', label: 'Operation', value: feature.operation, options: [
           { value: 'boss', label: 'Boss (Add)' },
           { value: 'cut', label: 'Cut (Remove)' },
         ]},
-      ]
+      )
+      return params
+    }
     case 'revolve':
       return [
         { type: 'select', key: 'axis', label: 'Axis', value: feature.axis, options: [
@@ -258,6 +336,41 @@ export function getFullEditableParams(feature: Feature): ParamDef[] {
       return [
         { type: 'number', key: 'distance', label: 'Distance', value: feature.distance, min: 0.01 },
       ]
+    case 'referencePlane': {
+      // Build base plane options: standard planes + existing reference planes
+      const basePlaneOptions: { value: string; label: string }[] = [
+        { value: 'XY', label: 'XY Plane' },
+        { value: 'XZ', label: 'XZ Plane' },
+        { value: 'YZ', label: 'YZ Plane' },
+      ]
+      if (allFeatures) {
+        for (const f of allFeatures) {
+          if (f.type === 'referencePlane' && !f.suppressed && f.id !== feature.id) {
+            basePlaneOptions.push({ value: f.id, label: f.name })
+          }
+        }
+      }
+
+      const params: ParamDef[] = [
+        { type: 'select', key: 'methodType', label: 'Method', value: feature.method.type, options: [
+          { value: 'offset', label: 'Offset from Plane' },
+          { value: 'angle', label: 'Angle from Plane' },
+        ]},
+        { type: 'select', key: 'basePlaneId', label: 'Base Plane', value: feature.method.basePlaneId, options: basePlaneOptions },
+      ]
+      if (feature.method.type === 'offset') {
+        params.push({ type: 'number', key: 'distance', label: 'Offset Distance', value: feature.method.distance })
+      } else {
+        params.push(
+          { type: 'number', key: 'angle', label: 'Angle (°)', value: feature.method.angle, min: -360, max: 360 },
+          { type: 'select', key: 'axisIndex', label: 'Rotation Axis', value: String(feature.method.axisIndex), options: [
+            { value: '0', label: 'Around X axis' },
+            { value: '1', label: 'Around Y axis' },
+          ]},
+        )
+      }
+      return params
+    }
     case 'sketch':
       return []
     default:
@@ -267,7 +380,7 @@ export function getFullEditableParams(feature: Feature): ParamDef[] {
 
 // ─── Feature type (excluding sketch) for creation ───────────
 
-export type CreatableFeatureType = 'extrude' | 'revolve' | 'fillet' | 'chamfer'
+export type CreatableFeatureType = 'extrude' | 'revolve' | 'fillet' | 'chamfer' | 'referencePlane'
 
 /**
  * Create a feature with default values.
@@ -289,6 +402,7 @@ export function createDefaultFeature(
         distance: 5,
         direction: 'normal',
         operation: options?.operation ?? 'boss',
+        mode: 'blind',
       }
     case 'revolve':
       return {
@@ -317,6 +431,21 @@ export function createDefaultFeature(
         suppressed: false,
         distance: 0.5,
         edgeIndices: options?.edgeIndices,
+      }
+    case 'referencePlane':
+      return {
+        id,
+        name: 'Ref Plane',
+        type: 'referencePlane',
+        suppressed: false,
+        method: { type: 'offset', basePlaneId: 'XY', distance: 10 },
+        plane: {
+          name: 'Ref Plane',
+          origin: [0, 0, 10],
+          normal: [0, 0, 1],
+          xDir: [1, 0, 0],
+          yDir: [0, 1, 0],
+        },
       }
   }
 }

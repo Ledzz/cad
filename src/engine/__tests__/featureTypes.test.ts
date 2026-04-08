@@ -141,7 +141,7 @@ describe('featureDisplayLabel', () => {
   it('returns "Cut Extrude" for cut operation', () => {
     const result = featureDisplayLabel({
       id: 'e1', name: 'Extrude', type: 'extrude', suppressed: false,
-      sketchId: 's1', distance: 5, direction: 'normal', operation: 'cut',
+      sketchId: 's1', distance: 5, direction: 'normal', operation: 'cut', mode: 'blind',
     })
     expect(result).toBe('Cut Extrude')
   })
@@ -149,7 +149,7 @@ describe('featureDisplayLabel', () => {
   it('returns "Extrude" for boss operation', () => {
     const result = featureDisplayLabel({
       id: 'e1', name: 'Extrude', type: 'extrude', suppressed: false,
-      sketchId: 's1', distance: 5, direction: 'normal', operation: 'boss',
+      sketchId: 's1', distance: 5, direction: 'normal', operation: 'boss', mode: 'blind',
     })
     expect(result).toBe('Extrude')
   })
@@ -167,7 +167,7 @@ describe('getEditableParams', () => {
   it('returns distance for extrude', () => {
     const params = getEditableParams({
       id: 'e1', name: 'Extrude', type: 'extrude', suppressed: false,
-      sketchId: 's1', distance: 10, direction: 'normal', operation: 'boss',
+      sketchId: 's1', distance: 10, direction: 'normal', operation: 'boss', mode: 'blind',
     })
     expect(params.distance).toBeDefined()
     expect(params.distance.value).toBe(10)
@@ -216,9 +216,9 @@ describe('getFullEditableParams', () => {
   it('returns number and select params for extrude', () => {
     const params = getFullEditableParams({
       id: 'e1', name: 'Extrude', type: 'extrude', suppressed: false,
-      sketchId: 's1', distance: 5, direction: 'normal', operation: 'boss',
+      sketchId: 's1', distance: 5, direction: 'normal', operation: 'boss', mode: 'blind',
     })
-    expect(params.length).toBe(3)
+    expect(params.length).toBe(4)
     const distance = params.find(p => p.key === 'distance')
     expect(distance).toBeDefined()
     expect(distance!.type).toBe('number')

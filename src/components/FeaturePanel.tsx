@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useAppStore } from '../store/appStore'
 import { getFullEditableParams, featureTypeLabel } from '../engine/featureTypes'
-import type { ParamDef } from '../engine/featureTypes'
+import type { ParamDef, ButtonParamDef } from '../engine/featureTypes'
 
 /**
  * Non-blocking feature parameter panel.
@@ -24,9 +24,11 @@ function FeaturePanelInner() {
   const commit = useAppStore((s) => s.commitFeaturePanel)
   const cancel = useAppStore((s) => s.cancelFeaturePanel)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
+  const startExtrudeFaceSelection = useAppStore((s) => s.startExtrudeFaceSelection)
+  const allFeatures = useAppStore((s) => s.features)
 
   const { mode, feature } = featurePanel
-  const params = getFullEditableParams(feature)
+  const params = getFullEditableParams(feature, allFeatures)
 
   const firstInputRef = useRef<HTMLInputElement>(null)
 
@@ -54,8 +56,14 @@ function FeaturePanelInner() {
       const parsed = parseFloat(rawValue)
       if (isNaN(parsed)) return
       updateParam(param.key, parsed)
-    } else {
+    } else if (param.type === 'select') {
       updateParam(param.key, rawValue)
+    }
+  }
+
+  const handleButtonClick = (param: ButtonParamDef) => {
+    if (param.key === 'selectFace') {
+      startExtrudeFaceSelection()
     }
   }
 
@@ -82,6 +90,7 @@ function FeaturePanelInner() {
               param={param}
               inputRef={i === 0 ? firstInputRef : undefined}
               onChange={(v) => handleParamChange(param, v)}
+              onButtonClick={() => param.type === 'button' && handleButtonClick(param)}
             />
           ))}
         </div>
@@ -114,10 +123,12 @@ function ParamField({
   param,
   inputRef,
   onChange,
+  onButtonClick,
 }: {
   param: ParamDef
   inputRef?: React.Ref<HTMLInputElement>
   onChange: (value: string) => void
+  onButtonClick?: () => void
 }) {
   if (param.type === 'number') {
     return (
@@ -139,6 +150,26 @@ function ParamField({
             }
           }}
         />
+      </div>
+    )
+  }
+
+  if (param.type === 'button') {
+    return (
+      <div>
+        <label className="text-[11px] text-gray-500 block mb-0.5">{param.label}</label>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="px-2.5 py-1.5 text-xs text-cyan-400 hover:text-cyan-300 bg-[#12122a] hover:bg-cyan-900/30 rounded border border-[#3a3a5a] transition-colors"
+            onClick={onButtonClick}
+          >
+            {param.buttonLabel}
+          </button>
+          {param.statusText && (
+            <span className="text-[10px] text-gray-500 truncate">{param.statusText}</span>
+          )}
+        </div>
       </div>
     )
   }

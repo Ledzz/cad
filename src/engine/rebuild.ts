@@ -7,11 +7,12 @@
  */
 
 import * as THREE from 'three'
-import type { Feature, SketchFeature, ExtrudeFeature, RevolveFeature, FilletFeature, ChamferFeature } from './featureTypes'
+import type { Feature, SketchFeature, ExtrudeFeature, RevolveFeature, FilletFeature, ChamferFeature, ReferencePlaneFeature } from './featureTypes'
 import type { TessellationData } from './tessellation'
 import { sketchToEdgeGroups, type OccEdgeDef } from './sketchToSolid'
 import type { SketchState } from './sketchTypes'
 import { getOccApi } from '../workers/occApi'
+import { computeReferencePlane } from './referencePlane'
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -91,7 +92,7 @@ async function buildExtrude(
   // Determine extrude direction from sketch normal + direction setting
   const normal = sketchFeature.sketch.plane.normal as [number, number, number]
   let direction: [number, number, number]
-  let distance = feature.distance
+  const mode = feature.mode ?? 'blind'
 
   switch (feature.direction) {
     case 'normal':
@@ -107,10 +108,44 @@ async function buildExtrude(
     case 'symmetric':
       // Symmetric: extrude half in normal, half in reverse — handled by worker
       direction = normal
-      distance = feature.distance / 2
       break
     default:
       direction = normal
+  }
+
+  // Compute extrude distance based on mode
+  let distance = feature.distance
+  const api = await getOccApi()
+
+  if (mode === 'throughAll') {
+    // Use bounding box of the target solid to determine a safe extrude distance
+    if (activeSolidId) {
+      const bbox = await api.getShapeBoundingBox(activeSolidId)
+      distance = bbox.diagonal * 2 + 10 // generous overshoot
+    } else {
+      // No existing solid — use a large default distance for boss through-all
+      distance = 1000
+    }
+  } else if (mode === 'upToFace') {
+    // Compute distance from sketch plane to target face
+    if (!feature.targetFaceRef) {
+      throw new Error(`Up-to-face extrude "${feature.id}" has no target face specified`)
+    }
+    const sketchOrigin = sketchFeature.sketch.plane.origin as [number, number, number]
+    const faceDist = await api.distanceToFace(
+      feature.targetFaceRef.shapeId,
+      feature.targetFaceRef.faceIndex,
+      sketchOrigin,
+      direction
+    )
+    if (faceDist === null || faceDist <= 0) {
+      throw new Error(`Up-to-face extrude "${feature.id}": could not compute distance to target face (face may be non-planar or behind sketch)`)
+    }
+    distance = faceDist
+  }
+
+  if (feature.direction === 'symmetric' && mode === 'blind') {
+    distance = feature.distance / 2
   }
 
   const operation = feature.operation ?? 'boss'
@@ -118,9 +153,7 @@ async function buildExtrude(
     throw new Error(`Cut extrude "${feature.id}" has no solid to cut from`)
   }
 
-  const api = await getOccApi()
-
-  if (feature.direction === 'symmetric') {
+  if (feature.direction === 'symmetric' && mode === 'blind') {
     // Symmetric extrude: extrude half in each direction and fuse
     const tess = await api.extrudeSketchSymmetric(feature.id, edgeGroups, direction, distance)
     return tessToGeometry(tess)
@@ -209,9 +242,21 @@ export async function rebuildAll(
         case 'sketch':
           // Sketches don't produce visible geometry in modeling mode.
           break
+        case 'referencePlane': {
+          // Reference planes don't produce solid geometry.
+          // Recompute the plane from the method parameters so downstream sketches use the right plane.
+          const refFeature = feature as ReferencePlaneFeature
+          const computed = computeReferencePlane(refFeature.method, features)
+          // Update the plane in place (mutates the feature for the current rebuild)
+          refFeature.plane = computed
+          break
+        }
         case 'extrude': {
           const operation = feature.operation ?? 'boss'
-          geometry = await buildExtrude(feature, features, operation === 'cut' ? activeSolidId : undefined)
+          const mode = feature.mode ?? 'blind'
+          // For through-all boss, we still want the bounding box of the active solid if it exists
+          const needsSolid = operation === 'cut' || mode === 'throughAll' || mode === 'upToFace'
+          geometry = await buildExtrude(feature, features, needsSolid ? activeSolidId : undefined)
 
           if (operation === 'cut' && activeSolidId) {
             // The cut result replaces the base solid — hide the base feature's geometry

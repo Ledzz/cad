@@ -7,6 +7,7 @@ import {
   snapshotSketch,
   createDefaultFeature,
   type SketchFeature,
+  type ReferencePlaneFeature,
 } from '../engine/featureTypes'
 import {
   getApplicableConstraints,
@@ -49,6 +50,7 @@ export function Toolbar() {
   const canRedo = useAppStore((s) => s.canRedo)
   const generateId = useAppStore((s) => s.generateId)
   const selectingSketchFace = useAppStore((s) => s.selectingSketchFace)
+  const selectingExtrudeFace = useAppStore((s) => s.selectingExtrudeFace)
   const startFaceSelection = useAppStore((s) => s.startFaceSelection)
   const cancelFaceSelection = useAppStore((s) => s.cancelFaceSelection)
   const sceneObjects = useAppStore((s) => s.sceneObjects)
@@ -264,9 +266,33 @@ export function Toolbar() {
     }
   }
 
+  const handleExport3MF = async () => {
+    setExporting(true)
+    try {
+      const api = await getOccApi()
+      const data = await api.export3MF()
+      downloadBlob(new Blob([new Uint8Array(data)], { type: 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml' }), 'export.3mf')
+    } catch (err) {
+      alert(`3MF export failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const handleImportSTEP = () => {
     stepInputRef.current?.click()
   }
+
+  const handleCreateRefPlane = async () => {
+    const id = generateFeatureId('refplane')
+    const feature = createDefaultFeature('referencePlane', id)
+    await openFeaturePanelCreate(feature)
+  }
+
+  // Gather reference planes from features for sketch-on-ref-plane buttons
+  const refPlanes = features.filter(
+    (f): f is ReferencePlaneFeature => f.type === 'referencePlane' && !f.suppressed
+  )
 
   const handleImportSTEPFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -377,6 +403,14 @@ export function Toolbar() {
           </button>
           <button
             className={buttonIdle}
+            onClick={handleExport3MF}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Export as 3MF"
+          >
+            3MF
+          </button>
+          <button
+            className={buttonIdle}
             onClick={handleImportSTEP}
             disabled={isBusy}
             title="Import a STEP file"
@@ -411,6 +445,29 @@ export function Toolbar() {
             title="Sketch on a planar face of an existing body"
           >
             Face
+          </button>
+          {refPlanes.map((rp) => (
+            <button
+              key={rp.id}
+              className={buttonIdle}
+              onClick={() => enterSketchMode(rp.plane)}
+              disabled={isBusy || selectingSketchFace}
+              title={`Sketch on ${rp.name}`}
+            >
+              {rp.name}
+            </button>
+          ))}
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+          {/* Reference Plane creation */}
+          <button
+            className={buttonIdle}
+            onClick={handleCreateRefPlane}
+            disabled={isBusy}
+            title="Create a reference plane (offset or angled)"
+          >
+            Ref Plane
           </button>
 
           <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
@@ -465,6 +522,12 @@ export function Toolbar() {
           {selectingSketchFace && (
             <span className="text-xs text-cyan-400 ml-2 animate-pulse">
               Click a planar face...
+            </span>
+          )}
+
+          {selectingExtrudeFace && (
+            <span className="text-xs text-cyan-400 ml-2 animate-pulse">
+              Click a face for up-to-face extrude...
             </span>
           )}
 
