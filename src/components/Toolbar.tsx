@@ -705,21 +705,21 @@ export function Toolbar() {
 // ─── Constraint Button Labels ───────────────────────────────
 
 const CONSTRAINT_LABELS: Record<SketchConstraint['type'], { label: string; title: string }> = {
-  coincident: { label: 'Co', title: 'Coincident — merge two points' },
-  horizontal: { label: 'H', title: 'Horizontal — make line/points horizontal' },
-  vertical: { label: 'V', title: 'Vertical — make line/points vertical' },
-  fixed: { label: 'Fix', title: 'Fixed — lock point position' },
-  distance: { label: 'D', title: 'Distance — set distance/length' },
-  horizontalDistance: { label: 'DH', title: 'Horizontal Distance' },
-  verticalDistance: { label: 'DV', title: 'Vertical Distance' },
-  angle: { label: 'Ang', title: 'Angle between two lines' },
-  perpendicular: { label: '⊥', title: 'Perpendicular — make lines 90°' },
-  parallel: { label: '∥', title: 'Parallel — make lines parallel' },
-  equal: { label: '=', title: 'Equal — make lengths/radii equal' },
-  radius: { label: 'R', title: 'Radius — set circle/arc radius' },
-  tangent: { label: 'T', title: 'Tangent' },
-  midpoint: { label: 'Mid', title: 'Midpoint — place point at line center' },
-  pointOnEntity: { label: 'On', title: 'Point on Entity — constrain point to line/circle' },
+  coincident: { label: 'Co', title: 'Coincident — merge two points (N)' },
+  horizontal: { label: 'H', title: 'Horizontal — make line/points horizontal (H)' },
+  vertical: { label: 'V', title: 'Vertical — make line/points vertical (V)' },
+  fixed: { label: 'Fix', title: 'Fixed — lock point position (F)' },
+  distance: { label: 'D', title: 'Distance — set distance/length (D)' },
+  horizontalDistance: { label: 'DH', title: 'Horizontal Distance (Shift+H)' },
+  verticalDistance: { label: 'DV', title: 'Vertical Distance (Shift+V)' },
+  angle: { label: 'Ang', title: 'Angle between two lines (Shift+A)' },
+  perpendicular: { label: '⊥', title: 'Perpendicular — make lines 90° (Q)' },
+  parallel: { label: '∥', title: 'Parallel — make lines parallel (G)' },
+  equal: { label: '=', title: 'Equal — make lengths/radii equal (E)' },
+  radius: { label: 'R', title: 'Radius — set circle/arc radius (I)' },
+  tangent: { label: 'T', title: 'Tangent (T)' },
+  midpoint: { label: 'Mid', title: 'Midpoint — place point at line center (M)' },
+  pointOnEntity: { label: 'On', title: 'Point on Entity — constrain point to line/circle (O)' },
 }
 
 const constraintButton =
@@ -734,32 +734,41 @@ function ConstraintButtons({
   applicable: SketchConstraint['type'][]
   onApply: (type: SketchConstraint['type']) => void
 }) {
-  // Show a curated set of constraint buttons; enable only the applicable ones
-  const allConstraints: SketchConstraint['type'][] = [
+  const applicableSet = new Set(applicable)
+
+  // Grouped constraint buttons:
+  //   Geometric: coincident, horizontal, vertical, fixed, perpendicular, parallel, tangent, midpoint, pointOnEntity
+  //   Dimensional: distance, horizontalDistance, verticalDistance, angle, radius, equal
+  const geometricConstraints: SketchConstraint['type'][] = [
     'coincident', 'horizontal', 'vertical', 'fixed',
-    'distance', 'perpendicular', 'parallel', 'equal',
-    'radius', 'tangent', 'midpoint',
+    'perpendicular', 'parallel', 'tangent', 'midpoint', 'pointOnEntity',
+  ]
+  const dimensionalConstraints: SketchConstraint['type'][] = [
+    'distance', 'horizontalDistance', 'verticalDistance',
+    'angle', 'radius', 'equal',
   ]
 
-  const applicableSet = new Set(applicable)
+  const renderButton = (type: SketchConstraint['type']) => {
+    const info = CONSTRAINT_LABELS[type]
+    const enabled = applicableSet.has(type)
+    return (
+      <button
+        key={type}
+        className={enabled ? constraintButton : constraintButtonDisabled}
+        onClick={() => enabled && onApply(type)}
+        disabled={!enabled}
+        title={info.title}
+      >
+        {info.label}
+      </button>
+    )
+  }
 
   return (
     <>
-      {allConstraints.map((type) => {
-        const info = CONSTRAINT_LABELS[type]
-        const enabled = applicableSet.has(type)
-        return (
-          <button
-            key={type}
-            className={enabled ? constraintButton : constraintButtonDisabled}
-            onClick={() => enabled && onApply(type)}
-            disabled={!enabled}
-            title={info.title}
-          >
-            {info.label}
-          </button>
-        )
-      })}
+      {geometricConstraints.map(renderButton)}
+      <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+      {dimensionalConstraints.map(renderButton)}
     </>
   )
 }

@@ -115,12 +115,16 @@ function useSketchKeyboardShortcuts() {
         case 'a':
         case 'A':
           if (!e.metaKey && !e.ctrlKey) {
-            store.setActiveSketchTool(store.activeSketch.activeTool === 'arc' ? null : 'arc')
+            if (e.shiftKey) {
+              applyConstraintShortcut(store, 'angle')
+            } else {
+              store.setActiveSketchTool(store.activeSketch.activeTool === 'arc' ? null : 'arc')
+            }
           }
           break
         case 'p':
         case 'P':
-          if (!e.metaKey && !e.ctrlKey) {
+          if (!e.metaKey && !e.ctrlKey && !e.shiftKey) {
             store.setActiveSketchTool(store.activeSketch.activeTool === 'point' ? null : 'point')
           }
           break
@@ -129,13 +133,21 @@ function useSketchKeyboardShortcuts() {
         case 'h':
         case 'H':
           if (!e.metaKey && !e.ctrlKey) {
-            applyConstraintShortcut(store, 'horizontal')
+            if (e.shiftKey) {
+              applyConstraintShortcut(store, 'horizontalDistance')
+            } else {
+              applyConstraintShortcut(store, 'horizontal')
+            }
           }
           break
         case 'v':
         case 'V':
           if (!e.metaKey && !e.ctrlKey) {
-            applyConstraintShortcut(store, 'vertical')
+            if (e.shiftKey) {
+              applyConstraintShortcut(store, 'verticalDistance')
+            } else {
+              applyConstraintShortcut(store, 'vertical')
+            }
           }
           break
         case 'd':
@@ -166,6 +178,36 @@ function useSketchKeyboardShortcuts() {
         case 'T':
           if (!e.metaKey && !e.ctrlKey) {
             applyConstraintShortcut(store, 'tangent')
+          }
+          break
+        case 'n':
+        case 'N':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'coincident')
+          }
+          break
+        case 'g':
+        case 'G':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'parallel')
+          }
+          break
+        case 'i':
+        case 'I':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'radius')
+          }
+          break
+        case 'm':
+        case 'M':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'midpoint')
+          }
+          break
+        case 'o':
+        case 'O':
+          if (!e.metaKey && !e.ctrlKey) {
+            applyConstraintShortcut(store, 'pointOnEntity')
           }
           break
       }

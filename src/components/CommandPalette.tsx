@@ -171,18 +171,21 @@ function buildCommands(): CadCommand[] {
 
   // ─── Sketch Constraints ──────────────────────────────
   const constraintTypes: Array<{ type: SketchConstraint['type']; label: string; shortcut?: string }> = [
-    { type: 'coincident', label: 'Coincident' },
+    { type: 'coincident', label: 'Coincident', shortcut: 'N' },
     { type: 'horizontal', label: 'Horizontal', shortcut: 'H' },
     { type: 'vertical', label: 'Vertical', shortcut: 'V' },
     { type: 'fixed', label: 'Fixed', shortcut: 'F' },
     { type: 'distance', label: 'Distance', shortcut: 'D' },
+    { type: 'horizontalDistance', label: 'Horizontal Distance', shortcut: 'Shift+H' },
+    { type: 'verticalDistance', label: 'Vertical Distance', shortcut: 'Shift+V' },
     { type: 'perpendicular', label: 'Perpendicular', shortcut: 'Q' },
-    { type: 'parallel', label: 'Parallel' },
+    { type: 'parallel', label: 'Parallel', shortcut: 'G' },
     { type: 'equal', label: 'Equal', shortcut: 'E' },
-    { type: 'radius', label: 'Radius' },
+    { type: 'radius', label: 'Radius', shortcut: 'I' },
     { type: 'tangent', label: 'Tangent', shortcut: 'T' },
-    { type: 'midpoint', label: 'Midpoint' },
-    { type: 'angle', label: 'Angle' },
+    { type: 'midpoint', label: 'Midpoint', shortcut: 'M' },
+    { type: 'angle', label: 'Angle', shortcut: 'Shift+A' },
+    { type: 'pointOnEntity', label: 'Point on Entity', shortcut: 'O' },
   ]
 
   for (const ct of constraintTypes) {
