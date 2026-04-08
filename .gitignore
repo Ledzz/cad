@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# OpenCascade.js custom WASM build outputs (large binary files)
+# Rebuild with: docker run --rm -v "$(pwd)/ocjs-build:/src" donalffons/opencascade.js custom_build.yml
+# Then copy outputs: cp ocjs-build/opencascade.{js,wasm,d.ts} src/wasm/ && cp ocjs-build/opencascade.wasm public/
+src/wasm/opencascade.js
+src/wasm/opencascade.wasm
+src/wasm/opencascade.d.ts
+public/opencascade.wasm
+ocjs-build/opencascade.js
+ocjs-build/opencascade.wasm
+ocjs-build/opencascade.d.ts

@@ -1,24 +1,35 @@
 import { useState, useRef, useEffect } from 'react'
 import { useAppStore } from '../store/appStore'
-import type { Feature } from '../engine/featureTypes'
+import type { Feature, ExtrudeFeature, RevolveFeature } from '../engine/featureTypes'
 
 // ─── Feature type icons (simple text-based) ─────────────────
 
-function FeatureIcon({ type }: { type: Feature['type'] }) {
-  const iconMap: Record<Feature['type'], { label: string; color: string }> = {
-    box: { label: 'B', color: 'bg-blue-600' },
-    cylinder: { label: 'C', color: 'bg-cyan-600' },
-    sphere: { label: 'S', color: 'bg-teal-600' },
-    sketch: { label: 'Sk', color: 'bg-amber-600' },
-    extrude: { label: 'E', color: 'bg-purple-600' },
+function FeatureIcon({ feature }: { feature: Feature }) {
+  let label: string
+  let color: string
+
+  if (feature.type === 'sketch') {
+    label = 'Sk'; color = 'bg-amber-600'
+  } else if (feature.type === 'extrude' && (feature as ExtrudeFeature).operation === 'cut') {
+    label = 'C'; color = 'bg-orange-600'
+  } else if (feature.type === 'extrude') {
+    label = 'E'; color = 'bg-purple-600'
+  } else if (feature.type === 'revolve') {
+    const axis = (feature as RevolveFeature).axis
+    label = `R${axis}`; color = 'bg-teal-600'
+  } else if (feature.type === 'fillet') {
+    label = 'Fi'; color = 'bg-blue-600'
+  } else if (feature.type === 'chamfer') {
+    label = 'Ch'; color = 'bg-indigo-600'
+  } else {
+    label = '?'; color = 'bg-gray-600'
   }
-  const icon = iconMap[type] ?? { label: '?', color: 'bg-gray-600' }
 
   return (
     <span
-      className={`w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center shrink-0 ${icon.color} text-white`}
+      className={`w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center shrink-0 ${color} text-white`}
     >
-      {icon.label}
+      {label}
     </span>
   )
 }
@@ -75,7 +86,7 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
   const setEditingFeature = useAppStore((s) => s.setEditingFeature)
   const editSketch = useAppStore((s) => s.editSketch)
 
-  const hasEditableParams = feature.type === 'box' || feature.type === 'cylinder' || feature.type === 'sphere' || feature.type === 'extrude'
+  const hasEditableParams = feature.type === 'extrude'
   const isSketch = feature.type === 'sketch'
 
   useEffect(() => {
@@ -250,7 +261,7 @@ export function FeatureTree() {
                   })
                 }}
               >
-                <FeatureIcon type={feature.type} />
+                <FeatureIcon feature={feature} />
                 {renamingId === feature.id ? (
                   <InlineRename
                     name={feature.name}

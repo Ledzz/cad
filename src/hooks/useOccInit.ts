@@ -1,17 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
-import { useAppStore } from '../store/appStore'
 import { getOccApi } from '../workers/occApi'
-import { generateFeatureId } from '../engine/featureTypes'
-import type { BoxFeature } from '../engine/featureTypes'
 
 /**
- * Hook that initializes OpenCascade in the Web Worker and creates
- * a test box feature, adding it to the parametric feature tree.
+ * Hook that initializes OpenCascade in the Web Worker.
+ * Loads the WASM binary on first mount and reports loading/error state.
  */
 export function useOccInit() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const addFeature = useAppStore((s) => s.addFeature)
   const initRef = useRef(false)
 
   useEffect(() => {
@@ -25,18 +21,6 @@ export function useOccInit() {
         // Initialize the OCCT worker (loads WASM)
         await getOccApi()
 
-        // Create a test box as a parametric feature
-        const boxFeature: BoxFeature = {
-          id: generateFeatureId('box'),
-          name: 'Box (10 x 6 x 4)',
-          type: 'box',
-          suppressed: false,
-          dx: 10,
-          dy: 6,
-          dz: 4,
-        }
-
-        await addFeature(boxFeature)
         setLoading(false)
       } catch (err) {
         console.error('[useOccInit] Failed:', err)
@@ -46,7 +30,7 @@ export function useOccInit() {
     }
 
     init()
-  }, [addFeature])
+  }, [])
 
   return { loading, error }
 }

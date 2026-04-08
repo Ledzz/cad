@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useThree } from '@react-three/fiber'
 import * as THREE from 'three'
 import { useAppStore } from '../store/appStore'
@@ -229,6 +229,35 @@ export function SketchInteraction() {
   const setSketchHovered = useAppStore((s) => s.setSketchHovered)
   const setSelectionRect = useAppStore((s) => s.setSelectionRect)
   const { raycaster, camera, pointer } = useThree()
+
+  // Finalize selection rect on any pointer release (on-canvas or off-canvas)
+  useEffect(() => {
+    const handleGlobalPointerUp = (e: PointerEvent) => {
+      if (!selectDragState.current?.isDragging) return
+
+      const sketch = useAppStore.getState().activeSketch
+      if (sketch?.selectionRect) {
+        const { startX, startY, endX, endY } = sketch.selectionRect
+        const isWindow = endX >= startX
+        const rect = normalizeRect(startX, startY, endX, endY)
+        const selected = getEntitiesInRect(rect, isWindow, sketch.entities)
+        const additive = !!(e.shiftKey || e.metaKey || e.ctrlKey)
+
+        if (additive) {
+          const combined = new Set([...sketch.selectedEntityIds, ...selected])
+          useAppStore.getState().setSketchSelection(Array.from(combined))
+        } else {
+          useAppStore.getState().setSketchSelection(selected)
+        }
+      }
+
+      useAppStore.getState().setSelectionRect(null)
+      // Keep isDragging true briefly so the R3F click event is suppressed
+      setTimeout(() => { selectDragState.current = null }, 0)
+    }
+    window.addEventListener('pointerup', handleGlobalPointerUp)
+    return () => window.removeEventListener('pointerup', handleGlobalPointerUp)
+  }, [])
 
   // Track point drag state
   const dragState = useRef<{
@@ -589,42 +618,15 @@ export function SketchInteraction() {
     // Selection is handled in handleClick (which fires after pointerDown + pointerUp)
   }, [getSketchPosition, getRawSketchPosition])
 
-  const handlePointerUp = useCallback((e: any) => {
+  const handlePointerUp = useCallback(() => {
     if (dragState.current?.isDragging) {
       dragState.current = null
     }
-
-    if (selectDragState.current?.isDragging) {
-      // Finalize the selection rectangle
-      const sketch = useAppStore.getState().activeSketch
-      if (sketch?.selectionRect) {
-        const { startX, startY, endX, endY } = sketch.selectionRect
-        const isWindow = endX >= startX // left-to-right = window select
-        const rect = normalizeRect(startX, startY, endX, endY)
-        const selected = getEntitiesInRect(rect, isWindow, sketch.entities)
-
-        const nativeEvent = e?.nativeEvent ?? e
-        const additive = !!(nativeEvent?.shiftKey || nativeEvent?.metaKey || nativeEvent?.ctrlKey)
-
-        if (additive) {
-          // Add to existing selection (deduplicate)
-          const combined = new Set([...sketch.selectedEntityIds, ...selected])
-          setSketchSelection(Array.from(combined))
-        } else {
-          setSketchSelection(selected)
-        }
-      }
-
-      setSelectionRect(null)
-      // Keep isDragging true briefly so handleClick is suppressed
-      setTimeout(() => {
-        selectDragState.current = null
-      }, 0)
-      return
+    // Selection rect finalization is handled by the global pointerup listener
+    if (!selectDragState.current?.isDragging) {
+      selectDragState.current = null
     }
-
-    selectDragState.current = null
-  }, [setSketchSelection, setSelectionRect])
+  }, [])
 
   // Build plane transform matrix
   const planeMatrix = useMemo(() => {

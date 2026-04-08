@@ -27,6 +27,30 @@ export interface SelectionState {
 
 export type AppMode = 'modeling' | 'sketching'
 
+// ─── Face Selection ─────────────────────────────────────────
+
+export interface HoveredFace {
+  featureId: string
+  faceIndex: number
+}
+
+// ─── Edge Selection ─────────────────────────────────────────
+
+export interface EdgeSelectionState {
+  /** Whether edge selection mode is active */
+  active: boolean
+  /** The operation type being configured */
+  operation: 'fillet' | 'chamfer'
+  /** The shape ID edges are from */
+  shapeId: string
+  /** Extracted edge polylines from the shape */
+  edges: number[][]
+  /** Indices of selected edges */
+  selectedEdgeIndices: number[]
+  /** Currently hovered edge index */
+  hoveredEdgeIndex: number | null
+}
+
 // ─── Feature editing state ──────────────────────────────────
 
 export interface EditingFeature {
@@ -47,6 +71,23 @@ export interface AppState {
   selection: SelectionState
   setSelection: (ids: string[]) => void
   setHovered: (id: string | null) => void
+
+  // Face selection mode (for "sketch on face")
+  selectingSketchFace: boolean
+  hoveredFace: HoveredFace | null
+  startFaceSelection: () => void
+  cancelFaceSelection: () => void
+  setHoveredFace: (face: HoveredFace | null) => void
+  /** Called when user clicks a face during face selection mode */
+  selectFaceForSketch: (featureId: string, faceIndex: number) => Promise<void>
+
+  // ─── Edge Selection Mode ────────────────────────────────
+  edgeSelection: EdgeSelectionState | null
+  startEdgeSelection: (operation: 'fillet' | 'chamfer') => Promise<void>
+  cancelEdgeSelection: () => void
+  toggleEdgeSelection: (edgeIndex: number) => void
+  setHoveredEdge: (edgeIndex: number | null) => void
+  confirmEdgeSelection: (value: number) => Promise<void>
 
   // ─── Undo / Redo ────────────────────────────────────────
   history: Feature[][]
@@ -76,6 +117,8 @@ export interface AppState {
   rebuild: () => Promise<void>
   /** Whether a rebuild is currently in progress. */
   isRebuilding: boolean
+  /** Replace all features with the given list and rebuild (used for load). */
+  loadProject: (features: Feature[]) => Promise<void>
 
   // ─── Feature editing ────────────────────────────────────
   editingFeature: EditingFeature | null
@@ -193,6 +236,155 @@ export const useAppStore = create<AppState>((set, get) => ({
   setHovered: (id) =>
     set((state) => ({ selection: { ...state.selection, hoveredId: id } })),
 
+  // ─── Face Selection Mode ───────────────────────────────
+
+  selectingSketchFace: false,
+  hoveredFace: null,
+
+  startFaceSelection: () => {
+    set({
+      selectingSketchFace: true,
+      hoveredFace: null,
+      selection: { selectedIds: [], hoveredId: null },
+    })
+  },
+
+  cancelFaceSelection: () => {
+    set({
+      selectingSketchFace: false,
+      hoveredFace: null,
+    })
+  },
+
+  setHoveredFace: (face) => {
+    set({ hoveredFace: face })
+  },
+
+  selectFaceForSketch: async (featureId, faceIndex) => {
+    const { getOccApi } = await import('../workers/occApi')
+    try {
+      const api = await getOccApi()
+
+      // Look up the actual shape ID in the registry.
+      // For multi-loop extrudes, sub-shapes are stored as "<id>__loop_N".
+      // We need to find the right shape that contains this face.
+      // Try the featureId directly first, then look for sub-shapes.
+      let shapeId = featureId
+      const result = await api.getFacePlane(shapeId, faceIndex)
+
+      if (!result) {
+        console.warn('[Store] Selected face is not planar — only planar faces can be used as sketch planes')
+        set({ selectingSketchFace: false, hoveredFace: null })
+        return
+      }
+
+      // Exit face selection mode and enter sketch mode with the face plane
+      set({ selectingSketchFace: false, hoveredFace: null })
+      get().enterSketchMode({
+        name: 'Face',
+        origin: result.origin,
+        normal: result.normal,
+        xDir: result.xDir,
+        yDir: result.yDir,
+      })
+    } catch (err) {
+      console.error('[Store] Failed to get face plane:', err)
+      set({ selectingSketchFace: false, hoveredFace: null })
+    }
+  },
+
+  // ─── Edge Selection Mode ────────────────────────────────
+
+  edgeSelection: null,
+
+  startEdgeSelection: async (operation) => {
+    // Find the last feature that produced a solid
+    const { features, sceneObjects } = get()
+    const solidFeatures = features.filter(
+      (f) => !f.suppressed && f.type !== 'sketch'
+    )
+    const lastSolid = solidFeatures[solidFeatures.length - 1]
+    if (!lastSolid) return
+
+    const shapeId = lastSolid.id
+    if (!sceneObjects.has(shapeId)) return
+
+    try {
+      const { getOccApi } = await import('../workers/occApi')
+      const api = await getOccApi()
+      const { edges } = await api.getShapeEdges(shapeId)
+
+      set({
+        edgeSelection: {
+          active: true,
+          operation,
+          shapeId,
+          edges,
+          selectedEdgeIndices: [],
+          hoveredEdgeIndex: null,
+        },
+        selection: { selectedIds: [], hoveredId: null },
+      })
+    } catch (err) {
+      console.error('[Store] Failed to get shape edges:', err)
+    }
+  },
+
+  cancelEdgeSelection: () => {
+    set({ edgeSelection: null })
+  },
+
+  toggleEdgeSelection: (edgeIndex) => {
+    const es = get().edgeSelection
+    if (!es) return
+    const selected = es.selectedEdgeIndices.includes(edgeIndex)
+      ? es.selectedEdgeIndices.filter((i) => i !== edgeIndex)
+      : [...es.selectedEdgeIndices, edgeIndex]
+    set({
+      edgeSelection: { ...es, selectedEdgeIndices: selected },
+    })
+  },
+
+  setHoveredEdge: (edgeIndex) => {
+    const es = get().edgeSelection
+    if (!es) return
+    set({
+      edgeSelection: { ...es, hoveredEdgeIndex: edgeIndex },
+    })
+  },
+
+  confirmEdgeSelection: async (value) => {
+    const es = get().edgeSelection
+    if (!es || es.selectedEdgeIndices.length === 0) return
+
+    const id = generateFeatureId(es.operation)
+    const edgeIndices = [...es.selectedEdgeIndices]
+
+    set({ edgeSelection: null })
+
+    if (es.operation === 'fillet') {
+      const feature: Feature = {
+        id,
+        name: `Fillet (r${value})`,
+        type: 'fillet',
+        suppressed: false,
+        radius: value,
+        edgeIndices,
+      }
+      await get().addFeature(feature)
+    } else {
+      const feature: Feature = {
+        id,
+        name: `Chamfer (d${value})`,
+        type: 'chamfer',
+        suppressed: false,
+        distance: value,
+        edgeIndices,
+      }
+      await get().addFeature(feature)
+    }
+  },
+
   // ─── Undo / Redo ───────────────────────────────────────
 
   history: [],
@@ -295,6 +487,20 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   rebuild: async () => {
     await performRebuild(get().features, set)
+  },
+
+  loadProject: async (features) => {
+    // Exit sketch mode if active, clear history, replace features
+    set({
+      mode: 'modeling',
+      activeSketch: null,
+      editingSketchFeatureId: null,
+      history: [],
+      future: [],
+      features,
+      selection: { selectedIds: [], hoveredId: null },
+    })
+    await performRebuild(features, set)
   },
 
   // ─── Feature editing ───────────────────────────────────

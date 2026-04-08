@@ -25,9 +25,6 @@ export interface EdgeData {
  */
 export type OccWorkerRequest =
   | { type: 'init' }
-  | { type: 'makeBox'; id: string; dx: number; dy: number; dz: number }
-  | { type: 'makeCylinder'; id: string; radius: number; height: number }
-  | { type: 'makeSphere'; id: string; radius: number }
 
 /**
  * Messages sent from the OCCT worker.

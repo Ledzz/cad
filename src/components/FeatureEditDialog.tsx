@@ -126,22 +126,59 @@ function FeatureEditDialogInner({
             )
           })}
 
-          {/* Direction selector for extrude features */}
+          {/* Direction + Operation selector for extrude features */}
           {feature.type === 'extrude' && (
+            <>
+              <div className="flex items-center gap-3">
+                <label className="text-xs text-gray-400 w-24 shrink-0">
+                  Direction
+                </label>
+                <select
+                  className="flex-1 bg-[#12122a] text-gray-200 text-sm px-2 py-1 rounded border border-[#3a3a5a] outline-none focus:border-blue-500/50"
+                  value={(values as any).direction ?? feature.direction}
+                  onChange={(e) =>
+                    setValues({ ...values, direction: e.target.value as any })
+                  }
+                >
+                  <option value="normal">Normal</option>
+                  <option value="reverse">Reverse</option>
+                  <option value="symmetric">Symmetric</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="text-xs text-gray-400 w-24 shrink-0">
+                  Operation
+                </label>
+                <select
+                  className="flex-1 bg-[#12122a] text-gray-200 text-sm px-2 py-1 rounded border border-[#3a3a5a] outline-none focus:border-blue-500/50"
+                  value={(values as any).operation ?? feature.operation ?? 'boss'}
+                  onChange={(e) =>
+                    setValues({ ...values, operation: e.target.value as any })
+                  }
+                >
+                  <option value="boss">Boss (Add)</option>
+                  <option value="cut">Cut (Remove)</option>
+                </select>
+              </div>
+            </>
+          )}
+
+          {/* Axis selector for revolve features */}
+          {feature.type === 'revolve' && (
             <div className="flex items-center gap-3">
               <label className="text-xs text-gray-400 w-24 shrink-0">
-                Direction
+                Axis
               </label>
               <select
                 className="flex-1 bg-[#12122a] text-gray-200 text-sm px-2 py-1 rounded border border-[#3a3a5a] outline-none focus:border-blue-500/50"
-                value={(values as any).direction ?? feature.direction}
+                value={(values as any).axis ?? feature.axis}
                 onChange={(e) =>
-                  setValues({ ...values, direction: e.target.value as any })
+                  setValues({ ...values, axis: e.target.value as any })
                 }
               >
-                <option value="normal">Normal</option>
-                <option value="reverse">Reverse</option>
-                <option value="symmetric">Symmetric</option>
+                <option value="X">X axis</option>
+                <option value="Y">Y axis</option>
+                <option value="Z">Z axis</option>
               </select>
             </div>
           )}

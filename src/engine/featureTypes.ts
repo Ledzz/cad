@@ -11,7 +11,7 @@ import type { SketchPlane, SketchEntity, SketchConstraint } from './sketchTypes'
 // ─── Base ───────────────────────────────────────────────────
 
 export interface BaseFeature {
-  /** Unique identifier (e.g. "box-1", "extrude-3") */
+  /** Unique identifier (e.g. "sketch-1", "extrude-3") */
   id: string
   /** Human-readable name shown in the feature tree */
   name: string
@@ -19,29 +19,6 @@ export interface BaseFeature {
   type: string
   /** If true, this feature is skipped during rebuild */
   suppressed: boolean
-}
-
-// ─── Primitive Features ─────────────────────────────────────
-
-export interface BoxFeature extends BaseFeature {
-  type: 'box'
-  /** Width along X */
-  dx: number
-  /** Height along Y */
-  dy: number
-  /** Depth along Z */
-  dz: number
-}
-
-export interface CylinderFeature extends BaseFeature {
-  type: 'cylinder'
-  radius: number
-  height: number
-}
-
-export interface SphereFeature extends BaseFeature {
-  type: 'sphere'
-  radius: number
 }
 
 // ─── Sketch Feature ─────────────────────────────────────────
@@ -68,6 +45,9 @@ export interface SketchFeature extends BaseFeature {
 
 export type ExtrudeDirection = 'normal' | 'reverse' | 'symmetric'
 
+/** 'boss' = add material; 'cut' = remove material from the previous solid */
+export type ExtrudeOperation = 'boss' | 'cut'
+
 export interface ExtrudeFeature extends BaseFeature {
   type: 'extrude'
   /** ID of the SketchFeature this extrude is based on */
@@ -76,16 +56,53 @@ export interface ExtrudeFeature extends BaseFeature {
   distance: number
   /** Which direction to extrude relative to the sketch plane normal */
   direction: ExtrudeDirection
+  /** Whether to add or subtract material. Defaults to 'boss'. */
+  operation: ExtrudeOperation
+}
+
+// ─── Revolve Feature ────────────────────────────────────────
+
+/** World axis to revolve around */
+export type RevolveAxis = 'X' | 'Y' | 'Z'
+
+export interface RevolveFeature extends BaseFeature {
+  type: 'revolve'
+  /** ID of the SketchFeature this revolve is based on */
+  sketchId: string
+  /** World axis to revolve around (passes through origin) */
+  axis: RevolveAxis
+  /** Revolution angle in degrees (1–360). 360 = full solid of revolution. */
+  angle: number
+}
+
+// ─── Fillet Feature ─────────────────────────────────────────
+
+export interface FilletFeature extends BaseFeature {
+  type: 'fillet'
+  /** Fillet radius in model units */
+  radius: number
+  /** If set, apply fillet only to these edge indices. If empty/undefined, apply to all edges. */
+  edgeIndices?: number[]
+}
+
+// ─── Chamfer Feature ────────────────────────────────────────
+
+export interface ChamferFeature extends BaseFeature {
+  type: 'chamfer'
+  /** Chamfer distance in model units */
+  distance: number
+  /** If set, apply chamfer only to these edge indices. If empty/undefined, apply to all edges. */
+  edgeIndices?: number[]
 }
 
 // ─── Union ──────────────────────────────────────────────────
 
 export type Feature =
-  | BoxFeature
-  | CylinderFeature
-  | SphereFeature
   | SketchFeature
   | ExtrudeFeature
+  | RevolveFeature
+  | FilletFeature
+  | ChamferFeature
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -138,42 +155,47 @@ export function restoreSketchEntities(
  */
 export function featureTypeLabel(type: Feature['type']): string {
   switch (type) {
-    case 'box': return 'Box'
-    case 'cylinder': return 'Cylinder'
-    case 'sphere': return 'Sphere'
     case 'sketch': return 'Sketch'
     case 'extrude': return 'Extrude'
+    case 'revolve': return 'Revolve'
+    case 'fillet': return 'Fillet'
+    case 'chamfer': return 'Chamfer'
     default: return 'Feature'
   }
+}
+
+/** Returns a label that includes the operation for extrude features. */
+export function featureDisplayLabel(feature: Feature): string {
+  if (feature.type === 'extrude') {
+    return feature.operation === 'cut' ? 'Cut Extrude' : 'Extrude'
+  }
+  return featureTypeLabel(feature.type)
 }
 
 /**
  * Get the editable parameter names for a feature type.
  * Used by the edit dialog to know which fields to show.
  */
-export function getEditableParams(feature: Feature): Record<string, { label: string; value: number; min?: number; step?: number }> {
+export function getEditableParams(feature: Feature): Record<string, { label: string; value: number; min?: number; max?: number; step?: number }> {
   switch (feature.type) {
-    case 'box':
-      return {
-        dx: { label: 'Width (X)', value: feature.dx, min: 0.01, step: 0.5 },
-        dy: { label: 'Height (Y)', value: feature.dy, min: 0.01, step: 0.5 },
-        dz: { label: 'Depth (Z)', value: feature.dz, min: 0.01, step: 0.5 },
-      }
-    case 'cylinder':
-      return {
-        radius: { label: 'Radius', value: feature.radius, min: 0.01, step: 0.5 },
-        height: { label: 'Height', value: feature.height, min: 0.01, step: 0.5 },
-      }
-    case 'sphere':
-      return {
-        radius: { label: 'Radius', value: feature.radius, min: 0.01, step: 0.5 },
-      }
     case 'extrude':
       return {
         distance: { label: 'Distance', value: feature.distance, min: 0.01, step: 0.5 },
       }
+    case 'revolve':
+      return {
+        angle: { label: 'Angle (°)', value: feature.angle, min: 1, max: 360, step: 1 },
+      }
+    case 'fillet':
+      return {
+        radius: { label: 'Radius', value: feature.radius, min: 0.01, step: 0.1 },
+      }
+    case 'chamfer':
+      return {
+        distance: { label: 'Distance', value: feature.distance, min: 0.01, step: 0.1 },
+      }
     case 'sketch':
-      return {} // sketches are edited by re-entering sketch mode
+      return {}
     default:
       return {}
   }

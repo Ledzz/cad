@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import * as Comlink from 'comlink'
-import type { OpenCascadeInstance, TopoDSShape, TopoDSWire } from '../engine/occTypes'
+import type { OpenCascadeInstance } from '../wasm/opencascade'
+import type { TopoDSShape, TopoDSShell, TopoDSWire, BRepAlgoAPI_Fuse, TopToolsListOfShape, EmscriptenFS } from '../engine/occTypes'
 import type { TessellationData, FaceRange } from '../engine/tessellation'
 
 let oc: OpenCascadeInstance | null = null
@@ -40,7 +41,7 @@ function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1,
   while (explorer.More()) {
     const face = oc.TopoDS.Face_1(explorer.Current())
     const location = new oc.TopLoc_Location_1()
-    const triangulationHandle = oc.BRep_Tool.Triangulation(face, location)
+    const triangulationHandle = oc.BRep_Tool.Triangulation(face, location, 0 as any /* Poly_MeshPurpose_NONE */)
 
     if (triangulationHandle && !triangulationHandle.IsNull()) {
       const triangulation = triangulationHandle.get()
@@ -172,6 +173,81 @@ function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1,
   }
 }
 
+// ─── Helpers ────────────────────────────────────────────────
+
+/**
+ * Get the last stored shape from the registry (the final solid in the feature chain).
+ * The rebuild engine always stores the latest result as the last entry.
+ */
+function getLastShape(): TopoDSShape | null {
+  let last: TopoDSShape | null = null
+  for (const [, shape] of shapeRegistry) {
+    last = shape
+  }
+  return last
+}
+
+/**
+ * Collect unique (deduplicated) edges from a shape.
+ * TopExp_Explorer visits each edge once per face it borders, so we deduplicate
+ * by hashing start+end point coordinates (rounded).
+ *
+ * Returns an array of OCCT TopoDSEdge objects in a stable order that matches
+ * the indices returned by getShapeEdges(). Caller must NOT delete these edges
+ * (they are owned by the shape).
+ */
+function collectUniqueEdges(shape: TopoDSShape): TopoDSShape[] {
+  if (!oc) return []
+
+  const uniqueEdges: TopoDSShape[] = []
+  const seenKeys = new Set<string>()
+
+  const explorer = new oc.TopExp_Explorer_2(
+    shape,
+    oc.TopAbs_ShapeEnum.TopAbs_EDGE,
+    oc.TopAbs_ShapeEnum.TopAbs_SHAPE
+  )
+
+  const round = (v: number) => Math.round(v * 1e4) / 1e4
+
+  while (explorer.More()) {
+    const edge = oc.TopoDS.Edge_1(explorer.Current())
+
+    try {
+      const adaptor = new oc.BRepAdaptor_Curve_2(edge)
+      const u0: number = adaptor.FirstParameter()
+      const u1: number = adaptor.LastParameter()
+
+      if (!isFinite(u0) || !isFinite(u1) || Math.abs(u1 - u0) < 1e-12) {
+        adaptor.delete()
+        explorer.Next()
+        continue
+      }
+
+      // Get start and end points for dedup key
+      const p0 = adaptor.Value(u0)
+      const p1 = adaptor.Value(u1)
+      const key1 = `${round(p0.X())},${round(p0.Y())},${round(p0.Z())}-${round(p1.X())},${round(p1.Y())},${round(p1.Z())}`
+      const key2 = `${round(p1.X())},${round(p1.Y())},${round(p1.Z())}-${round(p0.X())},${round(p0.Y())},${round(p0.Z())}`
+      p0.delete()
+      p1.delete()
+      adaptor.delete()
+
+      if (!seenKeys.has(key1) && !seenKeys.has(key2)) {
+        seenKeys.add(key1)
+        uniqueEdges.push(edge)
+      }
+    } catch {
+      // Skip degenerate edges
+    }
+
+    explorer.Next()
+  }
+
+  explorer.delete()
+  return uniqueEdges
+}
+
 // ─── Worker API ─────────────────────────────────────────────
 
 /**
@@ -180,10 +256,18 @@ function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1,
 const occWorkerApi = {
   async init(): Promise<boolean> {
     try {
-      // Dynamic import to load the WASM module
-      const occModule = await import('opencascade.js')
-      const initFn = occModule.default || occModule.initOpenCascade
-      oc = await initFn() as OpenCascadeInstance
+      // Dynamic import to load the custom-built WASM module
+      const occModule = await import('../wasm/opencascade.js')
+      const initFn = occModule.default
+      oc = await initFn({
+        // Tell Emscripten where to find the .wasm file
+        locateFile: (path: string) => {
+          if (path.endsWith('.wasm')) {
+            return '/opencascade.wasm'
+          }
+          return path
+        },
+      }) as OpenCascadeInstance
       console.log('[OCC Worker] OpenCascade initialized successfully')
       return true
     } catch (err) {
@@ -219,47 +303,128 @@ const occWorkerApi = {
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
   },
 
-  // ─── Primitive Builders ─────────────────────────────────
+  // ─── Face Geometry Query ─────────────────────────────────
 
-  makeBox(id: string, dx: number, dy: number, dz: number): TessellationData {
+  /**
+   * Extract the plane (origin, normal, xDir, yDir) from a planar face.
+   * Returns null if the face is not planar.
+   *
+   * @param shapeId - The shape ID in the registry
+   * @param faceIndex - The 0-based face index (matching faceRanges from tessellation)
+   */
+  getFacePlane(
+    shapeId: string,
+    faceIndex: number
+  ): { origin: [number, number, number]; normal: [number, number, number]; xDir: [number, number, number]; yDir: [number, number, number] } | null {
     if (!oc) throw new Error('OpenCascade not initialized')
-    const builder = new oc.BRepPrimAPI_MakeBox_1(dx, dy, dz)
-    const shape = builder.Shape()
 
-    // Store shape in registry (delete old one if exists)
-    occWorkerApi.deleteShape(id)
-    shapeRegistry.set(id, shape)
+    // Try direct lookup first
+    let shape = shapeRegistry.get(shapeId)
 
-    const result = tessellateShape(shape, id)
-    builder.delete()
-    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+    // If not found, this might be a multi-loop extrude. The sub-shapes are
+    // stored as "<id>__loop_0", "<id>__loop_1", etc. We need to find which
+    // sub-shape the faceIndex belongs to and compute the local face index.
+    if (!shape) {
+      let remainingIndex = faceIndex
+      let loopIdx = 0
+      while (true) {
+        const loopId = `${shapeId}__loop_${loopIdx}`
+        const loopShape = shapeRegistry.get(loopId)
+        if (!loopShape) break
+
+        // Count faces in this sub-shape
+        const explorer = new oc.TopExp_Explorer_2(
+          loopShape,
+          oc.TopAbs_ShapeEnum.TopAbs_FACE,
+          oc.TopAbs_ShapeEnum.TopAbs_SHAPE
+        )
+        let faceCount = 0
+        while (explorer.More()) { faceCount++; explorer.Next() }
+        explorer.delete()
+
+        if (remainingIndex < faceCount) {
+          // Found the right sub-shape
+          shape = loopShape
+          faceIndex = remainingIndex
+          break
+        }
+        remainingIndex -= faceCount
+        loopIdx++
+      }
+    }
+
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    // Iterate to the Nth face
+    const explorer = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_FACE,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE
+    )
+
+    let currentIndex = 0
+    while (explorer.More()) {
+      if (currentIndex === faceIndex) {
+        const face = oc.TopoDS.Face_1(explorer.Current())
+        const isReversed = face.Orientation_1() === oc.TopAbs_Orientation.TopAbs_REVERSED
+
+        // Use BRepAdaptor_Surface to get surface type and geometry
+        const adaptor = new oc.BRepAdaptor_Surface_2(face, true)
+        const surfType = adaptor.GetType()
+
+        if (surfType.value !== oc.GeomAbs_SurfaceType.GeomAbs_Plane.value) {
+          // Not a planar face
+          adaptor.delete()
+          explorer.delete()
+          return null
+        }
+
+        const pln = adaptor.Plane()
+        const pos = pln.Position()
+
+        const loc = pos.Location()
+        const dir = pos.Direction()
+        const xdir = pos.XDirection()
+        const ydir = pos.YDirection()
+
+        let nx = dir.X(), ny = dir.Y(), nz = dir.Z()
+        // Flip normal for reversed faces to match visual orientation
+        if (isReversed) { nx = -nx; ny = -ny; nz = -nz }
+
+        const result: {
+          origin: [number, number, number]
+          normal: [number, number, number]
+          xDir: [number, number, number]
+          yDir: [number, number, number]
+        } = {
+          origin: [loc.X(), loc.Y(), loc.Z()],
+          normal: [nx, ny, nz],
+          xDir: [xdir.X(), xdir.Y(), xdir.Z()],
+          yDir: [ydir.X(), ydir.Y(), ydir.Z()],
+        }
+
+        // If the face is reversed, also flip yDir so we maintain a right-handed
+        // coordinate system with the flipped normal: xDir × yDir = normal
+        if (isReversed) {
+          result.yDir = [-result.yDir[0], -result.yDir[1], -result.yDir[2]]
+        }
+
+        // Clean up OCCT objects
+        pln.delete()
+        adaptor.delete()
+        explorer.delete()
+        return result
+      }
+
+      currentIndex++
+      explorer.Next()
+    }
+
+    explorer.delete()
+    throw new Error(`Face index ${faceIndex} not found in shape "${shapeId}" (has ${currentIndex} faces)`)
   },
 
-  makeCylinder(id: string, radius: number, height: number): TessellationData {
-    if (!oc) throw new Error('OpenCascade not initialized')
-    const builder = new oc.BRepPrimAPI_MakeCylinder_1(radius, height)
-    const shape = builder.Shape()
-
-    occWorkerApi.deleteShape(id)
-    shapeRegistry.set(id, shape)
-
-    const result = tessellateShape(shape, id)
-    builder.delete()
-    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
-  },
-
-  makeSphere(id: string, radius: number): TessellationData {
-    if (!oc) throw new Error('OpenCascade not initialized')
-    const builder = new oc.BRepPrimAPI_MakeSphere_1(radius)
-    const shape = builder.Shape()
-
-    occWorkerApi.deleteShape(id)
-    shapeRegistry.set(id, shape)
-
-    const result = tessellateShape(shape, id)
-    builder.delete()
-    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
-  },
+  // ─── Wire/Edge builders ─────────────────────────────────
 
   /**
    * Build a wire from a group of edge definitions.
@@ -335,6 +500,9 @@ const occWorkerApi = {
    * Takes edge groups (each group is a separate connected loop),
    * builds wire → face → prism for each, and merges the tessellation
    * results into a single TessellationData.
+   *
+   * When `operation` is 'cut', the combined prism tool is subtracted from
+   * the target shape identified by `targetShapeId`.
    */
   extrudeSketch(
     id: string,
@@ -345,7 +513,9 @@ const occWorkerApi = {
       normal?: number[]
     }>>,
     extrudeDirection: [number, number, number],
-    extrudeDistance: number
+    extrudeDistance: number,
+    operation: 'boss' | 'cut' = 'boss',
+    targetShapeId?: string
   ): TessellationData {
     if (!oc) throw new Error('OpenCascade not initialized')
 
@@ -367,6 +537,102 @@ const occWorkerApi = {
     let globalVertexOffset = 0
     let globalFaceIndex = 0
 
+    if (operation === 'cut') {
+      // ── Cut (Boolean subtraction) ────────────────────────
+      if (!targetShapeId) throw new Error('Cut extrude requires a targetShapeId')
+      const targetShape = shapeRegistry.get(targetShapeId)
+      if (!targetShape) throw new Error(`Target shape "${targetShapeId}" not found in registry`)
+
+      // Build all loop prisms, fuse them into a single tool shape
+      let toolShape: TopoDSShape | null = null
+      const toolsToDelete: any[] = []
+
+      for (let loopIdx = 0; loopIdx < edgeGroups.length; loopIdx++) {
+        const edges = edgeGroups[loopIdx]
+        if (edges.length === 0) continue
+
+        const loopToDelete: any[] = []
+        try {
+          const { wire, toDelete: wireCleanup } = occWorkerApi._buildWireFromEdges(edges)
+          loopToDelete.push(...wireCleanup)
+
+          const faceBuilder = new oc.BRepBuilderAPI_MakeFace_15(wire, true)
+          loopToDelete.push(faceBuilder)
+          if (!faceBuilder.IsDone()) throw new Error(`Failed to create face (loop ${loopIdx})`)
+
+          const vec = new oc.gp_Vec_4(
+            extrudeDirection[0] * extrudeDistance,
+            extrudeDirection[1] * extrudeDistance,
+            extrudeDirection[2] * extrudeDistance
+          )
+          const prism = new oc.BRepPrimAPI_MakePrism_1(faceBuilder.Shape(), vec, false, true)
+          loopToDelete.push(prism)
+          vec.delete()
+
+          if (!prism.IsDone()) throw new Error(`Prism failed (loop ${loopIdx})`)
+          const prismShape = prism.Shape()
+
+          if (toolShape === null) {
+            toolShape = prismShape
+          } else {
+            // Fuse this prism into the accumulated tool
+            const fuseArgsList: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+            const fuseToolsList: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+            fuseArgsList.Append_1(toolShape)
+            fuseToolsList.Append_1(prismShape)
+            const fuseOp: BRepAlgoAPI_Fuse = new oc.BRepAlgoAPI_Fuse_1()
+            fuseOp.SetArguments(fuseArgsList)
+            fuseOp.SetTools(fuseToolsList)
+            fuseOp.Build(new oc.Message_ProgressRange_1())
+            toolsToDelete.push(fuseOp, fuseArgsList, fuseToolsList)
+            if (!fuseOp.IsDone()) throw new Error(`Tool fuse failed at loop ${loopIdx}`)
+            toolShape = fuseOp.Shape()
+          }
+        } finally {
+          for (const obj of loopToDelete) {
+            try { obj.delete() } catch { /* ignore */ }
+          }
+        }
+      }
+
+      if (!toolShape) throw new Error('No tool geometry produced for cut extrude')
+
+      // Subtract tool from target using SetArguments/SetTools/Build pattern
+      const argsList: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+      const toolsList: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+      argsList.Append_1(targetShape)
+      toolsList.Append_1(toolShape)
+
+      const cutOp = new oc.BRepAlgoAPI_Cut_1()
+      cutOp.SetArguments(argsList)
+      cutOp.SetTools(toolsList)
+      cutOp.Build(new oc.Message_ProgressRange_1())
+      toolsToDelete.push(cutOp, argsList, toolsList)
+      try {
+        if (!cutOp.IsDone()) throw new Error('Boolean cut operation failed')
+        const resultShape = cutOp.Shape()
+
+        // Store the result in the registry
+        shapeRegistry.set(id, resultShape)
+
+        // Tessellate the result
+        const tess = tessellateShape(resultShape, id)
+        const result: TessellationData = {
+          id,
+          vertices: tess.vertices,
+          normals: tess.normals,
+          indices: tess.indices,
+          faceRanges: tess.faceRanges,
+        }
+        return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+      } finally {
+        for (const obj of toolsToDelete) {
+          try { obj.delete() } catch { /* ignore */ }
+        }
+      }
+    }
+
+    // ── Boss (add material) ──────────────────────────────────
     for (let loopIdx = 0; loopIdx < edgeGroups.length; loopIdx++) {
       const edges = edgeGroups[loopIdx]
       if (edges.length === 0) continue
@@ -453,6 +719,510 @@ const occWorkerApi = {
     }
 
     return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+
+  /**
+   * Symmetric extrude: extrude half distance in each direction and fuse the two prisms.
+   */
+  extrudeSketchSymmetric(
+    id: string,
+    edgeGroups: Array<Array<{
+      type: 'line' | 'arc' | 'circle'
+      points: number[][]
+      radius?: number
+      normal?: number[]
+    }>>,
+    direction: [number, number, number],
+    halfDistance: number
+  ): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    // Clean up old shapes
+    occWorkerApi.deleteShape(id)
+    for (const key of shapeRegistry.keys()) {
+      if (key.startsWith(id + '__')) {
+        const shape = shapeRegistry.get(key)
+        if (shape) { try { shape.delete() } catch { /* ignore */ } }
+        shapeRegistry.delete(key)
+      }
+    }
+
+    const allToDelete: any[] = []
+
+    try {
+      // Build all loop prisms in both directions, fuse them
+      let combinedShape: TopoDSShape | null = null
+
+      for (let loopIdx = 0; loopIdx < edgeGroups.length; loopIdx++) {
+        const edges = edgeGroups[loopIdx]
+        if (edges.length === 0) continue
+
+        const { wire, toDelete: wireCleanup } = occWorkerApi._buildWireFromEdges(edges)
+        allToDelete.push(...wireCleanup)
+
+        const faceBuilder = new oc.BRepBuilderAPI_MakeFace_15(wire, true)
+        allToDelete.push(faceBuilder)
+        if (!faceBuilder.IsDone()) throw new Error(`Failed to create face (loop ${loopIdx})`)
+
+        const face = faceBuilder.Shape()
+
+        // Forward prism
+        const vecFwd = new oc.gp_Vec_4(
+          direction[0] * halfDistance,
+          direction[1] * halfDistance,
+          direction[2] * halfDistance
+        )
+        const prismFwd = new oc.BRepPrimAPI_MakePrism_1(face, vecFwd, false, true)
+        allToDelete.push(prismFwd)
+        vecFwd.delete()
+        if (!prismFwd.IsDone()) throw new Error(`Forward prism failed (loop ${loopIdx})`)
+
+        // Reverse prism
+        const vecRev = new oc.gp_Vec_4(
+          -direction[0] * halfDistance,
+          -direction[1] * halfDistance,
+          -direction[2] * halfDistance
+        )
+        const prismRev = new oc.BRepPrimAPI_MakePrism_1(face, vecRev, false, true)
+        allToDelete.push(prismRev)
+        vecRev.delete()
+        if (!prismRev.IsDone()) throw new Error(`Reverse prism failed (loop ${loopIdx})`)
+
+        // Fuse the two prisms
+        const fuseArgs: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+        const fuseTools: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+        fuseArgs.Append_1(prismFwd.Shape())
+        fuseTools.Append_1(prismRev.Shape())
+        const fuseOp: BRepAlgoAPI_Fuse = new oc.BRepAlgoAPI_Fuse_1()
+        fuseOp.SetArguments(fuseArgs)
+        fuseOp.SetTools(fuseTools)
+        fuseOp.Build(new oc.Message_ProgressRange_1())
+        allToDelete.push(fuseOp, fuseArgs, fuseTools)
+        if (!fuseOp.IsDone()) throw new Error(`Symmetric fuse failed (loop ${loopIdx})`)
+
+        const loopShape = fuseOp.Shape()
+
+        if (combinedShape === null) {
+          combinedShape = loopShape
+        } else {
+          // Fuse with previous loops
+          const combineArgs: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+          const combineTools: TopToolsListOfShape = new oc.TopTools_ListOfShape_1()
+          combineArgs.Append_1(combinedShape)
+          combineTools.Append_1(loopShape)
+          const combineOp: BRepAlgoAPI_Fuse = new oc.BRepAlgoAPI_Fuse_1()
+          combineOp.SetArguments(combineArgs)
+          combineOp.SetTools(combineTools)
+          combineOp.Build(new oc.Message_ProgressRange_1())
+          allToDelete.push(combineOp, combineArgs, combineTools)
+          if (!combineOp.IsDone()) throw new Error(`Loop combine fuse failed`)
+          combinedShape = combineOp.Shape()
+        }
+      }
+
+      if (!combinedShape) throw new Error('No geometry produced from symmetric extrude')
+
+      shapeRegistry.set(id, combinedShape)
+      const tess = tessellateShape(combinedShape, id)
+      return Comlink.transfer(tess, [tess.vertices.buffer, tess.normals.buffer, tess.indices.buffer])
+    } finally {
+      for (const obj of allToDelete) {
+        try { obj.delete() } catch { /* ignore */ }
+      }
+    }
+  },
+
+  /**
+   * Revolve a sketch profile around a world axis.
+   *
+   * @param id - Feature ID (used as registry key)
+   * @param edgeGroups - Connected loops from the sketch
+   * @param axisDirection - Unit vector of the world axis ([1,0,0]=X, [0,1,0]=Y, [0,0,1]=Z)
+   * @param angle - Revolution angle in degrees (360 = full solid of revolution)
+   */
+  revolveSketch(
+    id: string,
+    edgeGroups: Array<Array<{
+      type: 'line' | 'arc' | 'circle'
+      points: number[][]
+      radius?: number
+      normal?: number[]
+    }>>,
+    axisDirection: [number, number, number],
+    angle: number
+  ): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    // Clean up previous shapes for this feature
+    occWorkerApi.deleteShape(id)
+    for (const key of shapeRegistry.keys()) {
+      if (key.startsWith(id + '__loop_')) {
+        const s = shapeRegistry.get(key)
+        if (s) { try { s.delete() } catch { /* ignore */ } }
+        shapeRegistry.delete(key)
+      }
+    }
+
+    const allVertices: number[] = []
+    const allNormals: number[] = []
+    const allIndices: number[] = []
+    const allFaceRanges: FaceRange[] = []
+    let globalVertexOffset = 0
+    let globalFaceIndex = 0
+
+    for (let loopIdx = 0; loopIdx < edgeGroups.length; loopIdx++) {
+      const edges = edgeGroups[loopIdx]
+      if (edges.length === 0) continue
+
+      const allToDelete: any[] = []
+      try {
+        // Build wire → face
+        const { wire, toDelete: wireCleanup } = occWorkerApi._buildWireFromEdges(edges)
+        allToDelete.push(...wireCleanup)
+
+        const faceBuilder = new oc.BRepBuilderAPI_MakeFace_15(wire, true)
+        allToDelete.push(faceBuilder)
+        if (!faceBuilder.IsDone()) throw new Error(`Failed to create face (loop ${loopIdx})`)
+
+        // Build the revolution axis through the world origin
+        const origin = new oc.gp_Pnt_3(0, 0, 0)
+        const dir = new oc.gp_Dir_4(axisDirection[0], axisDirection[1], axisDirection[2])
+        const ax1 = new oc.gp_Ax1_2(origin, dir)
+        allToDelete.push(origin, dir, ax1)
+
+        const face = faceBuilder.Face()
+
+        // Build revolve — prefer _2 for full revolutions (proper closed solid),
+        // _1 for partial angles.  Use IsDone() as the gate to avoid ever calling
+        // Shape() on a failed builder (which throws a raw C++ exception pointer
+        // that corrupts Emscripten's exception state for subsequent WASM calls).
+        const angleRad = (angle / 180) * Math.PI
+        const isFull = angle >= 360
+
+        const faceRevolve = isFull
+          ? new oc.BRepPrimAPI_MakeRevol_2(face, ax1, false)
+          : new oc.BRepPrimAPI_MakeRevol_1(face, ax1, angleRad, false)
+        allToDelete.push(faceRevolve)
+
+        let solid: TopoDSShape
+        if (faceRevolve.IsDone()) {
+          solid = faceRevolve.Shape()
+        } else {
+          // Face revolve failed (e.g. face normal parallel to axis, or profile
+          // on axis). Fall back: revolve the wire to get a shell, then wrap
+          // with MakeSolid. Wire revolve has no cap topology — avoids the
+          // degenerate-cap issue that kills face revolve.
+          const wireRevolve = isFull
+            ? new oc.BRepPrimAPI_MakeRevol_2(wire, ax1, false)
+            : new oc.BRepPrimAPI_MakeRevol_1(wire, ax1, angleRad, false)
+          allToDelete.push(wireRevolve)
+
+          if (!wireRevolve.IsDone()) {
+            throw new Error(
+              `Revolve failed (loop ${loopIdx}). Ensure the sketch profile is ` +
+              `fully on one side of the ${['X','Y','Z'][axisDirection.indexOf(1)] ?? '?'} axis ` +
+              `and does not cross or touch the axis.`
+            )
+          }
+
+          const shell = wireRevolve.Shape()
+          const solidBuilder = new oc.BRepBuilderAPI_MakeSolid_3(shell as TopoDSShell)
+          allToDelete.push(solidBuilder)
+          solid = solidBuilder.IsDone() ? solidBuilder.Shape() : shell
+        }
+
+        if (!solid || solid.IsNull()) throw new Error(`Revolve produced null shape (loop ${loopIdx})`)
+
+        const loopId = edgeGroups.length === 1 ? id : `${id}__loop_${loopIdx}`
+        shapeRegistry.set(loopId, solid)
+
+        const tess = tessellateShape(solid, loopId)
+        const vertCount = tess.vertices.length / 3
+        const indexOffset = allIndices.length
+
+        for (let i = 0; i < tess.vertices.length; i++) allVertices.push(tess.vertices[i])
+        for (let i = 0; i < tess.normals.length; i++) allNormals.push(tess.normals[i])
+        for (let i = 0; i < tess.indices.length; i++) allIndices.push(tess.indices[i] + globalVertexOffset)
+        for (const range of tess.faceRanges) {
+          allFaceRanges.push({
+            faceIndex: range.faceIndex + globalFaceIndex,
+            startIndex: range.startIndex + indexOffset,
+            count: range.count,
+          })
+        }
+
+        globalVertexOffset += vertCount
+        globalFaceIndex += tess.faceRanges.length
+      } finally {
+        for (const obj of allToDelete) {
+          try { obj.delete() } catch { /* ignore */ }
+        }
+      }
+    }
+
+    if (allVertices.length === 0) throw new Error('No geometry produced from revolve')
+
+    const result: TessellationData = {
+      id,
+      vertices: new Float32Array(allVertices),
+      normals: new Float32Array(allNormals),
+      indices: new Uint32Array(allIndices),
+      faceRanges: allFaceRanges,
+    }
+
+    return Comlink.transfer(result, [result.vertices.buffer, result.normals.buffer, result.indices.buffer])
+  },
+
+  /**
+   * Apply a constant-radius fillet to edges of a stored shape.
+   * If edgeIndices is provided, only those edges are filleted (0-based).
+   * Otherwise, all edges are filleted.
+   */
+  filletShape(id: string, targetShapeId: string, radius: number, edgeIndices?: number[]): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const targetShape = shapeRegistry.get(targetShapeId)
+    if (!targetShape) throw new Error(`Target shape "${targetShapeId}" not found in registry`)
+
+    occWorkerApi.deleteShape(id)
+
+    const fillet = new oc.BRepFilletAPI_MakeFillet(targetShape, oc.ChFi3d_FilletShape.ChFi3d_Rational)
+    try {
+      const uniqueEdges = collectUniqueEdges(targetShape)
+      const useAll = !edgeIndices || edgeIndices.length === 0
+      const edgeSet = useAll ? null : new Set(edgeIndices)
+      let edgeCount = 0
+
+      for (let i = 0; i < uniqueEdges.length; i++) {
+        if (useAll || edgeSet!.has(i)) {
+          const edge = oc.TopoDS.Edge_1(uniqueEdges[i])
+          try {
+            fillet.Add_2(radius, edge)
+            edgeCount++
+          } catch (e) {
+            console.warn(`[OCC Worker] Failed to add edge ${i} to fillet:`, e)
+          }
+        }
+      }
+
+      if (edgeCount === 0) throw new Error('No edges could be filleted')
+
+      fillet.Build(new oc.Message_ProgressRange_1())
+      if (!fillet.IsDone()) throw new Error('Fillet operation failed')
+
+      const resultShape = fillet.Shape()
+      shapeRegistry.set(id, resultShape)
+
+      const tess = tessellateShape(resultShape, id)
+      return Comlink.transfer(tess, [tess.vertices.buffer, tess.normals.buffer, tess.indices.buffer])
+    } finally {
+      fillet.delete()
+    }
+  },
+
+  /**
+   * Apply an equal-distance chamfer to edges of a stored shape.
+   * If edgeIndices is provided, only those edges are chamfered (0-based).
+   * Otherwise, all edges are chamfered.
+   */
+  chamferShape(id: string, targetShapeId: string, distance: number, edgeIndices?: number[]): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const targetShape = shapeRegistry.get(targetShapeId)
+    if (!targetShape) throw new Error(`Target shape "${targetShapeId}" not found in registry`)
+
+    occWorkerApi.deleteShape(id)
+
+    const chamfer = new oc.BRepFilletAPI_MakeChamfer(targetShape)
+    try {
+      const uniqueEdges = collectUniqueEdges(targetShape)
+      const useAll = !edgeIndices || edgeIndices.length === 0
+      const edgeSet = useAll ? null : new Set(edgeIndices)
+      let edgeCount = 0
+
+      for (let i = 0; i < uniqueEdges.length; i++) {
+        if (useAll || edgeSet!.has(i)) {
+          const edge = oc.TopoDS.Edge_1(uniqueEdges[i])
+          try {
+            chamfer.Add_2(distance, edge)
+            edgeCount++
+          } catch (e) {
+            console.warn(`[OCC Worker] Failed to add edge ${i} to chamfer:`, e)
+          }
+        }
+      }
+
+      if (edgeCount === 0) throw new Error('No edges could be chamfered')
+
+      chamfer.Build(new oc.Message_ProgressRange_1())
+      if (!chamfer.IsDone()) throw new Error('Chamfer operation failed')
+
+      const resultShape = chamfer.Shape()
+      shapeRegistry.set(id, resultShape)
+
+      const tess = tessellateShape(resultShape, id)
+      return Comlink.transfer(tess, [tess.vertices.buffer, tess.normals.buffer, tess.indices.buffer])
+    } finally {
+      chamfer.delete()
+    }
+  },
+
+  // ─── Edge Extraction ──────────────────────────────────────
+
+  /**
+   * Extract edges from a stored shape as polyline segments for rendering.
+   * Returns an array of edge polylines: each edge is an array of [x,y,z] points.
+   * Used for edge selection UI.
+   */
+  getShapeEdges(shapeId: string): { edges: number[][] } {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    const uniqueEdges = collectUniqueEdges(shape)
+    const edges: number[][] = []
+
+    const NUM_SAMPLES = 32 // number of points to sample along each curve
+
+    for (const edgeShape of uniqueEdges) {
+      try {
+        const edge = oc.TopoDS.Edge_1(edgeShape)
+        const adaptor = new oc.BRepAdaptor_Curve_2(edge)
+        const u0: number = adaptor.FirstParameter()
+        const u1: number = adaptor.LastParameter()
+
+        const points: number[] = []
+        for (let i = 0; i <= NUM_SAMPLES; i++) {
+          const u = u0 + (u1 - u0) * (i / NUM_SAMPLES)
+          const pnt = adaptor.Value(u)
+          points.push(pnt.X(), pnt.Y(), pnt.Z())
+          pnt.delete()
+        }
+
+        adaptor.delete()
+
+        if (points.length >= 6) {
+          edges.push(points)
+        }
+      } catch {
+        // Push empty to keep index alignment with collectUniqueEdges
+        edges.push([])
+      }
+    }
+
+    return { edges }
+  },
+
+  // ─── File I/O ──────────────────────────────────────────────
+
+  /**
+   * Export the final solid as a STEP file.
+   * Returns the file contents as a Uint8Array.
+   */
+  exportSTEP(): Uint8Array {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    // Find the last stored shape (the final solid)
+    const shape = getLastShape()
+    if (!shape) throw new Error('No shape to export')
+
+    const writer = new oc.STEPControl_Writer_1()
+    const fs: EmscriptenFS = oc.FS as any
+    const filename = '/tmp/export.step'
+
+    try {
+      writer.Transfer(shape, oc.STEPControl_StepModelType.STEPControl_AsIs, true, new oc.Message_ProgressRange_1())
+      const status = writer.Write(filename)
+
+      // IFSelect_RetDone.value === 1 — but comparing .value is fragile across builds,
+      // so just check that it matches the enum member.
+      if (status.value !== oc.IFSelect_ReturnStatus.IFSelect_RetDone.value) {
+        throw new Error(`STEP write failed with status ${status.value}`)
+      }
+
+      const data = fs.readFile(filename) as Uint8Array
+      fs.unlink(filename)
+      return Comlink.transfer(data, [data.buffer])
+    } finally {
+      writer.delete()
+    }
+  },
+
+  /**
+   * Import a STEP file and return tessellation data for rendering.
+   * The imported shape is stored in the registry under the given id.
+   */
+  importSTEP(id: string, fileData: Uint8Array): TessellationData {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const fs: EmscriptenFS = oc.FS as any
+    const filename = '/tmp/import.step'
+
+    try {
+      fs.writeFile(filename, fileData)
+
+      const reader = new oc.STEPControl_Reader_1()
+      try {
+        const readStatus = reader.ReadFile(filename)
+        if (readStatus.value !== oc.IFSelect_ReturnStatus.IFSelect_RetDone.value) {
+          throw new Error(`STEP read failed with status ${readStatus.value}`)
+        }
+
+        const numRoots = reader.NbRootsForTransfer()
+        if (numRoots === 0) throw new Error('STEP file contains no transferable roots')
+
+        reader.TransferRoots(new oc.Message_ProgressRange_1())
+        const shape = reader.OneShape()
+        if (!shape || shape.IsNull()) throw new Error('STEP import produced null shape')
+
+        // Store in registry
+        shapeRegistry.set(id, shape)
+
+        const tess = tessellateShape(shape, id)
+        return Comlink.transfer(tess, [tess.vertices.buffer, tess.normals.buffer, tess.indices.buffer])
+      } finally {
+        reader.delete()
+      }
+    } finally {
+      try { fs.unlink(filename) } catch { /* ignore */ }
+    }
+  },
+
+  /**
+   * Export the final solid as a binary STL file.
+   * Returns the file contents as a Uint8Array.
+   */
+  exportSTL(_ascii: boolean = false): Uint8Array {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = getLastShape()
+    if (!shape) throw new Error('No shape to export')
+
+    const fs: EmscriptenFS = oc.FS as any
+    const filename = '/tmp/export.stl'
+
+    // Ensure mesh is up-to-date
+    const mesh = new oc.BRepMesh_IncrementalMesh_2(shape, 0.1, false, 0.5, false)
+    try {
+      if (!mesh.IsDone()) throw new Error('Tessellation failed for STL export')
+
+      const writer = new oc.StlAPI_Writer()
+      try {
+        // Note: In v2 build, SetASCIIMode is no longer available as a setter.
+        // The writer defaults to binary mode. ASCII mode is not supported in this build.
+        const success = writer.Write(shape, filename, new oc.Message_ProgressRange_1())
+        if (!success) throw new Error('STL write failed')
+
+        const data = fs.readFile(filename) as Uint8Array
+        fs.unlink(filename)
+        return Comlink.transfer(data, [data.buffer])
+      } finally {
+        writer.delete()
+      }
+    } finally {
+      mesh.delete()
+    }
   },
 }
 

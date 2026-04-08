@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useAppStore } from '../store/appStore'
 import { SKETCH_PLANES } from '../engine/sketchTypes'
 import type { SketchConstraint } from '../engine/sketchTypes'
@@ -7,11 +7,16 @@ import {
   snapshotSketch,
   type SketchFeature,
   type ExtrudeFeature,
+  type RevolveFeature,
+  type FilletFeature,
+  type ChamferFeature,
 } from '../engine/featureTypes'
 import {
   getApplicableConstraints,
   createConstraintFromSelection,
 } from '../engine/constraintSolver'
+import { saveProject, loadProjectFile } from '../engine/projectFile'
+import { getOccApi } from '../workers/occApi'
 
 const buttonBase =
   'px-2 py-1 text-xs rounded transition-colors cursor-pointer select-none'
@@ -22,6 +27,15 @@ const buttonActive =
 const buttonDisabled =
   `${buttonBase} text-gray-600 cursor-not-allowed`
 
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 export function Toolbar() {
   const mode = useAppStore((s) => s.mode)
   const activeSketch = useAppStore((s) => s.activeSketch)
@@ -31,6 +45,7 @@ export function Toolbar() {
   const confirmSketchEdit = useAppStore((s) => s.confirmSketchEdit)
   const setActiveSketchTool = useAppStore((s) => s.setActiveSketchTool)
   const addFeatures = useAppStore((s) => s.addFeatures)
+  const addFeature = useAppStore((s) => s.addFeature)
   const addConstraint = useAppStore((s) => s.addConstraint)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
   const undo = useAppStore((s) => s.undo)
@@ -38,7 +53,21 @@ export function Toolbar() {
   const canUndo = useAppStore((s) => s.canUndo)
   const canRedo = useAppStore((s) => s.canRedo)
   const generateId = useAppStore((s) => s.generateId)
+  const selectingSketchFace = useAppStore((s) => s.selectingSketchFace)
+  const startFaceSelection = useAppStore((s) => s.startFaceSelection)
+  const cancelFaceSelection = useAppStore((s) => s.cancelFaceSelection)
+  const sceneObjects = useAppStore((s) => s.sceneObjects)
+  const features = useAppStore((s) => s.features)
+  const loadProject = useAppStore((s) => s.loadProject)
+  const edgeSelection = useAppStore((s) => s.edgeSelection)
+  const startEdgeSelection = useAppStore((s) => s.startEdgeSelection)
+  const cancelEdgeSelection = useAppStore((s) => s.cancelEdgeSelection)
+  const confirmEdgeSelection = useAppStore((s) => s.confirmEdgeSelection)
   const [extruding, setExtruding] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const stepInputRef = useRef<HTMLInputElement>(null)
 
   const activeTool = activeSketch?.activeTool ?? null
   const isEditingExisting = editingSketchFeatureId !== null
@@ -88,7 +117,7 @@ export function Toolbar() {
     }
   }
 
-  const handleFinishAndExtrude = async () => {
+  const handleFinishAndExtrude = async (operation: 'boss' | 'cut' = 'boss') => {
     if (!activeSketch) return
 
     // Count non-point, non-construction entities
@@ -130,14 +159,16 @@ export function Toolbar() {
 
         // Create an ExtrudeFeature referencing the sketch
         const extrudeId = generateFeatureId('extrude')
+        const label = operation === 'cut' ? 'Cut' : 'Extrude'
         const extrudeFeature: ExtrudeFeature = {
           id: extrudeId,
-          name: `Extrude (${Math.abs(distance)}mm)`,
+          name: `${label} (${Math.abs(distance)}mm)`,
           type: 'extrude',
           suppressed: false,
           sketchId,
           distance: Math.abs(distance),
           direction: distance > 0 ? 'normal' : 'reverse',
+          operation,
         }
 
         // Add both features and rebuild
@@ -147,6 +178,56 @@ export function Toolbar() {
     } catch (err) {
       console.error('[Toolbar] Extrude failed:', err)
       alert(`Extrude failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setExtruding(false)
+    }
+  }
+
+  const handleFinishAndRevolve = async () => {
+    if (!activeSketch) return
+
+    const hasProfile = Array.from(activeSketch.entities.values()).some(
+      (e) => e.type !== 'point' && !e.construction
+    )
+    if (!hasProfile) { exitSketchMode(); return }
+
+    const axisStr = prompt('Revolve axis (X, Y, or Z):', 'Y')
+    if (!axisStr) return
+    const axis = axisStr.trim().toUpperCase() as 'X' | 'Y' | 'Z'
+    if (!['X', 'Y', 'Z'].includes(axis)) { alert('Axis must be X, Y, or Z'); return }
+
+    const angleStr = prompt('Angle (degrees, 1–360):', '360')
+    if (!angleStr) return
+    const angle = parseFloat(angleStr)
+    if (isNaN(angle) || angle <= 0 || angle > 360) { alert('Angle must be between 1 and 360'); return }
+
+    setExtruding(true)
+    try {
+      const sketchId = generateFeatureId('sketch')
+      const sketchFeature: SketchFeature = {
+        id: sketchId,
+        name: `Sketch (${activeSketch.plane.name})`,
+        type: 'sketch',
+        suppressed: false,
+        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
+      }
+
+      const revolveId = generateFeatureId('revolve')
+      const revolveFeature: RevolveFeature = {
+        id: revolveId,
+        name: `Revolve ${angle}° (${axis})`,
+        type: 'revolve',
+        suppressed: false,
+        sketchId,
+        axis,
+        angle,
+      }
+
+      await addFeatures([sketchFeature, revolveFeature])
+      exitSketchMode()
+    } catch (err) {
+      console.error('[Toolbar] Revolve failed:', err)
+      alert(`Revolve failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
     } finally {
       setExtruding(false)
     }
@@ -168,12 +249,167 @@ export function Toolbar() {
     }
   }
 
-  const isBusy = extruding || isRebuilding
+  const handleFillet = async () => {
+    if (sceneObjects.size === 0) { alert('No solid to fillet.'); return }
+    if (edgeSelection?.active) { cancelEdgeSelection(); return }
+    await startEdgeSelection('fillet')
+  }
+
+  const handleChamfer = async () => {
+    if (sceneObjects.size === 0) { alert('No solid to chamfer.'); return }
+    if (edgeSelection?.active) { cancelEdgeSelection(); return }
+    await startEdgeSelection('chamfer')
+  }
+
+  const handleConfirmEdges = async () => {
+    if (!edgeSelection) return
+    const label = edgeSelection.operation === 'fillet' ? 'Fillet radius' : 'Chamfer distance'
+    const defaultVal = edgeSelection.operation === 'fillet' ? '0.5' : '0.5'
+    const input = prompt(`${label}:`, defaultVal)
+    if (!input) return
+    const value = parseFloat(input)
+    if (isNaN(value) || value <= 0) return
+    await confirmEdgeSelection(value)
+  }
+
+  const handleApplyAllEdges = async (operation: 'fillet' | 'chamfer') => {
+    const label = operation === 'fillet' ? 'Fillet radius' : 'Chamfer distance'
+    const input = prompt(`${label} (all edges):`, '0.5')
+    if (!input) return
+    const value = parseFloat(input)
+    if (isNaN(value) || value <= 0) return
+
+    const id = generateFeatureId(operation)
+    if (operation === 'fillet') {
+      const feature: FilletFeature = {
+        id,
+        name: `Fillet (r${value})`,
+        type: 'fillet',
+        suppressed: false,
+        radius: value,
+      }
+      try { await addFeature(feature) } catch (err) {
+        alert(`Fillet failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      }
+    } else {
+      const feature: ChamferFeature = {
+        id,
+        name: `Chamfer (d${value})`,
+        type: 'chamfer',
+        suppressed: false,
+        distance: value,
+      }
+      try { await addFeature(feature) } catch (err) {
+        alert(`Chamfer failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      }
+    }
+  }
+
+  const handleSave = () => {
+    if (features.length === 0) {
+      alert('No features to save.')
+      return
+    }
+    saveProject(features)
+  }
+
+  const handleLoadClick = () => {
+    fileInputRef.current?.click()
+  }
+
+  const handleLoadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    // Reset input so the same file can be re-loaded
+    e.target.value = ''
+    setLoading(true)
+    try {
+      const loaded = await loadProjectFile(file)
+      await loadProject(loaded)
+    } catch (err) {
+      alert(`Failed to load project: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleExportSTL = async () => {
+    setExporting(true)
+    try {
+      const api = await getOccApi()
+      const data = await api.exportSTL(false) // binary STL
+      downloadBlob(new Blob([new Uint8Array(data)], { type: 'application/octet-stream' }), 'export.stl')
+    } catch (err) {
+      alert(`STL export failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleExportSTEP = async () => {
+    setExporting(true)
+    try {
+      const api = await getOccApi()
+      const data = await api.exportSTEP()
+      downloadBlob(new Blob([new Uint8Array(data)], { type: 'application/octet-stream' }), 'export.step')
+    } catch (err) {
+      alert(`STEP export failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleImportSTEP = () => {
+    stepInputRef.current?.click()
+  }
+
+  const handleImportSTEPFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    setLoading(true)
+    try {
+      const arrayBuffer = await file.arrayBuffer()
+      const api = await getOccApi()
+      const id = generateFeatureId('import')
+      const tess = await api.importSTEP(id, new Uint8Array(arrayBuffer))
+      // Create geometry from tessellation and add to scene
+      const { importStepAsGeometry } = await import('../engine/rebuild')
+      const geometry = importStepAsGeometry(tess)
+      // Replace scene with imported geometry
+      const store = useAppStore.getState()
+      store.clearSceneObjects()
+      store.addSceneObject(id, geometry)
+    } catch (err) {
+      alert(`STEP import failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const isBusy = extruding || isRebuilding || loading || exporting
 
   return (
     <div className="h-10 bg-[#16162a] border-b border-[#2a2a4a] flex items-center px-3 gap-2 shrink-0">
       <span className="text-sm font-semibold text-gray-300 tracking-wide">CAD</span>
       <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+      {/* Hidden file input for project load */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,.cad.json"
+        className="hidden"
+        onChange={handleLoadFile}
+      />
+      {/* Hidden file input for STEP import */}
+      <input
+        ref={stepInputRef}
+        type="file"
+        accept=".step,.stp"
+        className="hidden"
+        onChange={handleImportSTEPFile}
+      />
 
       {mode === 'modeling' ? (
         <>
@@ -197,6 +433,54 @@ export function Toolbar() {
 
           <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
 
+          {/* Save / Load */}
+          <button
+            className={buttonIdle}
+            onClick={handleSave}
+            disabled={isBusy || features.length === 0}
+            title="Save project to .cad.json"
+          >
+            Save
+          </button>
+          <button
+            className={buttonIdle}
+            onClick={handleLoadClick}
+            disabled={isBusy}
+            title="Load project from .cad.json"
+          >
+            {loading ? 'Loading...' : 'Load'}
+          </button>
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+          {/* Export / Import */}
+          <button
+            className={buttonIdle}
+            onClick={handleExportSTL}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Export as binary STL"
+          >
+            {exporting ? 'Exporting...' : 'STL'}
+          </button>
+          <button
+            className={buttonIdle}
+            onClick={handleExportSTEP}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Export as STEP"
+          >
+            STEP
+          </button>
+          <button
+            className={buttonIdle}
+            onClick={handleImportSTEP}
+            disabled={isBusy}
+            title="Import a STEP file"
+          >
+            Import
+          </button>
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
           {/* Sketch plane selection */}
           <span className="text-xs text-gray-500 mr-1">Sketch on:</span>
           {Object.entries(SKETCH_PLANES).map(([name, plane]) => (
@@ -204,11 +488,80 @@ export function Toolbar() {
               key={name}
               className={buttonIdle}
               onClick={() => enterSketchMode(plane)}
-              disabled={isBusy}
+              disabled={isBusy || selectingSketchFace}
             >
               {name}
             </button>
           ))}
+          <button
+            className={selectingSketchFace ? buttonActive : buttonIdle}
+            onClick={() => {
+              if (selectingSketchFace) {
+                cancelFaceSelection()
+              } else {
+                startFaceSelection()
+              }
+            }}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Sketch on a planar face of an existing body"
+          >
+            Face
+          </button>
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+          {/* Fillet / Chamfer */}
+          <button
+            className={edgeSelection?.operation === 'fillet' ? buttonActive : buttonIdle}
+            onClick={handleFillet}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Select edges to fillet"
+          >
+            Fillet
+          </button>
+          <button
+            className={edgeSelection?.operation === 'chamfer' ? buttonActive : buttonIdle}
+            onClick={handleChamfer}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Select edges to chamfer"
+          >
+            Chamfer
+          </button>
+
+          {/* Edge selection controls */}
+          {edgeSelection?.active && (
+            <>
+              <span className="text-xs text-cyan-400 ml-1">
+                {edgeSelection.selectedEdgeIndices.length} edge{edgeSelection.selectedEdgeIndices.length !== 1 ? 's' : ''}
+              </span>
+              <button
+                className={`${buttonBase} text-green-400 hover:text-green-300 hover:bg-green-900/30`}
+                onClick={handleConfirmEdges}
+                disabled={edgeSelection.selectedEdgeIndices.length === 0}
+              >
+                Apply
+              </button>
+              <button
+                className={`${buttonBase} text-gray-400 hover:text-gray-200 hover:bg-[#2a2a4a]`}
+                onClick={() => handleApplyAllEdges(edgeSelection.operation)}
+                title="Apply to all edges instead"
+              >
+                All
+              </button>
+              <button
+                className={`${buttonBase} text-red-400 hover:text-red-300 hover:bg-red-900/30`}
+                onClick={cancelEdgeSelection}
+              >
+                Cancel
+              </button>
+            </>
+          )}
+
+          {selectingSketchFace && (
+            <span className="text-xs text-cyan-400 ml-2 animate-pulse">
+              Click a planar face...
+            </span>
+          )}
           {isRebuilding && (
             <span className="text-xs text-yellow-400 ml-2 animate-pulse">
               Rebuilding...
@@ -285,10 +638,26 @@ export function Toolbar() {
 
           <button
             className={`${buttonBase} text-purple-400 hover:text-purple-300 hover:bg-purple-900/30`}
-            onClick={handleFinishAndExtrude}
+            onClick={() => handleFinishAndExtrude('boss')}
             disabled={isBusy}
           >
             {extruding ? 'Extruding...' : 'Extrude'}
+          </button>
+          <button
+            className={`${buttonBase} text-orange-400 hover:text-orange-300 hover:bg-orange-900/30`}
+            onClick={() => handleFinishAndExtrude('cut')}
+            disabled={isBusy}
+            title="Cut Extrude — subtract material from existing solid"
+          >
+            {extruding ? 'Cutting...' : 'Cut'}
+          </button>
+          <button
+            className={`${buttonBase} text-teal-400 hover:text-teal-300 hover:bg-teal-900/30`}
+            onClick={handleFinishAndRevolve}
+            disabled={isBusy}
+            title="Revolve — rotate profile around a world axis"
+          >
+            {extruding ? 'Revolving...' : 'Revolve'}
           </button>
           <button
             className={`${buttonBase} text-green-400 hover:text-green-300 hover:bg-green-900/30`}

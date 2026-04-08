@@ -5,8 +5,27 @@ import { SketchRenderer } from './SketchRenderer'
 import { SketchInteraction } from './SketchInteraction'
 import { useOccInit } from '../hooks/useOccInit'
 import { useAppStore } from '../store/appStore'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
+
+// ─── Named view camera positions ────────────────────────────
+
+interface NamedView {
+  label: string
+  key: string
+  position: [number, number, number]
+  up?: [number, number, number]
+}
+
+const NAMED_VIEWS: NamedView[] = [
+  { label: 'F', key: 'Front',  position: [0, 0, 30] },
+  { label: 'B', key: 'Back',   position: [0, 0, -30] },
+  { label: 'T', key: 'Top',    position: [0, 30, 0], up: [0, 0, -1] },
+  { label: 'Bo', key: 'Bottom', position: [0, -30, 0], up: [0, 0, 1] },
+  { label: 'L', key: 'Left',   position: [-30, 0, 0] },
+  { label: 'R', key: 'Right',  position: [30, 0, 0] },
+  { label: 'Iso', key: 'Iso',  position: [20, 20, 20] },
+]
 
 /**
  * Smoothly animates the camera to look at the sketch plane head-on.
@@ -62,12 +81,100 @@ function SketchCameraController() {
   return null
 }
 
-function SceneContent() {
+/**
+ * Component that imperatively animates the camera to named views.
+ * Accessed via a ref from the parent.
+ */
+interface CameraActions {
+  flyToView: (position: [number, number, number], up?: [number, number, number]) => void
+  zoomToFit: () => void
+}
+
+function CameraController({ actionsRef }: { actionsRef: React.MutableRefObject<CameraActions | null> }) {
+  const { camera, scene } = useThree()
+
+  actionsRef.current = {
+    flyToView(position, up) {
+      const startPos = camera.position.clone()
+      const targetPos = new THREE.Vector3(...position)
+      const startUp = camera.up.clone()
+      const targetUp = up ? new THREE.Vector3(...up) : new THREE.Vector3(0, 1, 0)
+      const target = new THREE.Vector3(0, 0, 0)
+      const duration = 400
+      const startTime = performance.now()
+
+      function animate() {
+        const elapsed = performance.now() - startTime
+        const t = Math.min(elapsed / duration, 1)
+        const ease = 1 - Math.pow(1 - t, 3)
+
+        camera.position.lerpVectors(startPos, targetPos, ease)
+        camera.up.lerpVectors(startUp, targetUp, ease).normalize()
+        camera.lookAt(target)
+
+        if (t < 1) {
+          requestAnimationFrame(animate)
+        }
+      }
+
+      animate()
+    },
+
+    zoomToFit() {
+      // Compute bounding box of all meshes in the scene
+      const box = new THREE.Box3()
+      scene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj.geometry) {
+          const meshBox = new THREE.Box3().setFromObject(obj)
+          box.union(meshBox)
+        }
+      })
+
+      if (box.isEmpty()) return
+
+      const center = box.getCenter(new THREE.Vector3())
+      const size = box.getSize(new THREE.Vector3())
+      const maxDim = Math.max(size.x, size.y, size.z)
+      const fov = (camera as THREE.PerspectiveCamera).fov * (Math.PI / 180)
+      const distance = (maxDim / 2) / Math.tan(fov / 2) * 1.5
+
+      // Keep current direction, just adjust distance
+      const dir = camera.position.clone().sub(center).normalize()
+      const targetPos = center.clone().add(dir.multiplyScalar(distance))
+
+      const startPos = camera.position.clone()
+      const duration = 400
+      const startTime = performance.now()
+
+      function animate() {
+        const elapsed = performance.now() - startTime
+        const t = Math.min(elapsed / duration, 1)
+        const ease = 1 - Math.pow(1 - t, 3)
+
+        camera.position.lerpVectors(startPos, targetPos, ease)
+        camera.lookAt(center)
+
+        if (t < 1) {
+          requestAnimationFrame(animate)
+        }
+      }
+
+      animate()
+    },
+  }
+
+  return null
+}
+
+function SceneContent({ cameraActionsRef }: { cameraActionsRef: React.MutableRefObject<CameraActions | null> }) {
   const mode = useAppStore((s) => s.mode)
   const isSketchMode = mode === 'sketching'
 
   return (
     <>
+      {/* Camera controller for named views / zoom-to-fit */}
+      <CameraController actionsRef={cameraActionsRef} />
+
       {/* Lighting */}
       <ambientLight intensity={0.4} />
       <directionalLight position={[10, 20, 10]} intensity={0.8} castShadow />
@@ -153,19 +260,52 @@ export function Viewport() {
   const setSelection = useAppStore((s) => s.setSelection)
   const mode = useAppStore((s) => s.mode)
   const setSketchSelection = useAppStore((s) => s.setSketchSelection)
+  const setHoveredFace = useAppStore((s) => s.setHoveredFace)
+  const cameraActionsRef = useRef<CameraActions | null>(null)
 
   const handlePointerMissed = () => {
     if (mode === 'sketching') {
       setSketchSelection([])
     } else {
       setSelection([])
+      setHoveredFace(null)
     }
   }
+
+  const handleZoomToFit = useCallback(() => {
+    cameraActionsRef.current?.zoomToFit()
+  }, [])
+
+  const handleNamedView = useCallback((view: NamedView) => {
+    cameraActionsRef.current?.flyToView(view.position, view.up)
+  }, [])
 
   return (
     <div className="flex-1 relative bg-[#1a1a2e]">
       {loading && <LoadingOverlay />}
       {error && <ErrorOverlay message={error} />}
+
+      {/* View control buttons — bottom-left overlay */}
+      <div className="absolute bottom-3 left-3 z-10 flex gap-1">
+        {NAMED_VIEWS.map((view) => (
+          <button
+            key={view.key}
+            className="px-1.5 py-0.5 text-[10px] rounded bg-[#16162a]/80 text-gray-400 hover:text-gray-200 hover:bg-[#2a2a4a]/90 border border-[#2a2a4a]/50 cursor-pointer select-none transition-colors"
+            onClick={() => handleNamedView(view)}
+            title={view.key}
+          >
+            {view.label}
+          </button>
+        ))}
+        <button
+          className="px-1.5 py-0.5 text-[10px] rounded bg-[#16162a]/80 text-gray-400 hover:text-gray-200 hover:bg-[#2a2a4a]/90 border border-[#2a2a4a]/50 cursor-pointer select-none transition-colors"
+          onClick={handleZoomToFit}
+          title="Zoom to fit (show all geometry)"
+        >
+          Fit
+        </button>
+      </div>
+
       <Canvas
         camera={{
           position: [15, 15, 15],
@@ -176,7 +316,7 @@ export function Viewport() {
         gl={{ antialias: true }}
         onPointerMissed={handlePointerMissed}
       >
-        <SceneContent />
+        <SceneContent cameraActionsRef={cameraActionsRef} />
       </Canvas>
     </div>
   )

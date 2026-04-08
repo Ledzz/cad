@@ -181,6 +181,20 @@ function useGlobalKeyboardShortcuts() {
     function handleKeyDown(e: KeyboardEvent) {
       const store = useAppStore.getState()
 
+      // Escape: cancel face selection mode
+      if (e.key === 'Escape' && store.selectingSketchFace) {
+        e.preventDefault()
+        store.cancelFaceSelection()
+        return
+      }
+
+      // Escape: cancel edge selection mode
+      if (e.key === 'Escape' && store.edgeSelection?.active) {
+        e.preventDefault()
+        store.cancelEdgeSelection()
+        return
+      }
+
       // Undo: Ctrl/Cmd+Z (without Shift)
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
         e.preventDefault()

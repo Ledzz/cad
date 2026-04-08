@@ -7,7 +7,7 @@
  */
 
 import * as THREE from 'three'
-import type { Feature, SketchFeature, ExtrudeFeature } from './featureTypes'
+import type { Feature, SketchFeature, ExtrudeFeature, RevolveFeature, FilletFeature, ChamferFeature } from './featureTypes'
 import type { TessellationData } from './tessellation'
 import { sketchToEdgeGroups, type OccEdgeDef } from './sketchToSolid'
 import type { SketchState } from './sketchTypes'
@@ -22,6 +22,13 @@ function tessToGeometry(tess: TessellationData): THREE.BufferGeometry {
   geometry.setIndex(new THREE.BufferAttribute(tess.indices, 1))
   geometry.userData = { faceRanges: tess.faceRanges }
   return geometry
+}
+
+/**
+ * Convert tessellation data to a BufferGeometry (public for STEP import).
+ */
+export function importStepAsGeometry(tess: TessellationData): THREE.BufferGeometry {
+  return tessToGeometry(tess)
 }
 
 /**
@@ -55,33 +62,10 @@ function snapshotToSketchState(sketch: SketchFeature): SketchState {
 
 // ─── Feature Builders ───────────────────────────────────────
 
-async function buildBox(
-  feature: Feature & { type: 'box' }
-): Promise<THREE.BufferGeometry> {
-  const api = await getOccApi()
-  const tess = await api.makeBox(feature.id, feature.dx, feature.dy, feature.dz)
-  return tessToGeometry(tess)
-}
-
-async function buildCylinder(
-  feature: Feature & { type: 'cylinder' }
-): Promise<THREE.BufferGeometry> {
-  const api = await getOccApi()
-  const tess = await api.makeCylinder(feature.id, feature.radius, feature.height)
-  return tessToGeometry(tess)
-}
-
-async function buildSphere(
-  feature: Feature & { type: 'sphere' }
-): Promise<THREE.BufferGeometry> {
-  const api = await getOccApi()
-  const tess = await api.makeSphere(feature.id, feature.radius)
-  return tessToGeometry(tess)
-}
-
 async function buildExtrude(
   feature: ExtrudeFeature,
-  features: Feature[]
+  features: Feature[],
+  activeSolidId?: string
 ): Promise<THREE.BufferGeometry> {
   // Find the referenced sketch feature
   const sketchFeature = features.find(
@@ -118,17 +102,72 @@ async function buildExtrude(
       ]
       break
     case 'symmetric':
-      // For symmetric, extrude half distance in each direction
-      // For now, just do full distance in normal direction
-      // (proper symmetric would need two prisms fused)
+      // Symmetric: extrude half in normal, half in reverse — handled by worker
       direction = normal
+      distance = feature.distance / 2
       break
     default:
       direction = normal
   }
 
+  const operation = feature.operation ?? 'boss'
+  if (operation === 'cut' && !activeSolidId) {
+    throw new Error(`Cut extrude "${feature.id}" has no solid to cut from`)
+  }
+
   const api = await getOccApi()
-  const tess = await api.extrudeSketch(feature.id, edgeGroups, direction, distance)
+
+  if (feature.direction === 'symmetric') {
+    // Symmetric extrude: extrude half in each direction and fuse
+    const tess = await api.extrudeSketchSymmetric(feature.id, edgeGroups, direction, distance)
+    return tessToGeometry(tess)
+  }
+
+  const tess = await api.extrudeSketch(feature.id, edgeGroups, direction, distance, operation, activeSolidId)
+  return tessToGeometry(tess)
+}
+
+async function buildRevolve(
+  feature: RevolveFeature,
+  features: Feature[]
+): Promise<THREE.BufferGeometry> {
+  const sketchFeature = features.find(
+    (f) => f.id === feature.sketchId && f.type === 'sketch'
+  ) as SketchFeature | undefined
+
+  if (!sketchFeature) {
+    throw new Error(`Revolve "${feature.id}" references sketch "${feature.sketchId}" which was not found`)
+  }
+
+  const sketchState = snapshotToSketchState(sketchFeature)
+  const edgeGroups: OccEdgeDef[][] = sketchToEdgeGroups(sketchState)
+  if (edgeGroups.length === 0 || edgeGroups.every((g) => g.length === 0)) {
+    throw new Error(`Sketch "${feature.sketchId}" has no edges to revolve`)
+  }
+
+  const axisMap: Record<string, [number, number, number]> = {
+    X: [1, 0, 0],
+    Y: [0, 1, 0],
+    Z: [0, 0, 1],
+  }
+  const axisDirection = axisMap[feature.axis] ?? [0, 1, 0]
+
+  const api = await getOccApi()
+  const tess = await api.revolveSketch(feature.id, edgeGroups, axisDirection, feature.angle)
+  return tessToGeometry(tess)
+}
+
+async function buildFillet(feature: FilletFeature, activeSolidId: string | undefined): Promise<THREE.BufferGeometry> {
+  if (!activeSolidId) throw new Error(`Fillet "${feature.id}" has no solid to fillet`)
+  const api = await getOccApi()
+  const tess = await api.filletShape(feature.id, activeSolidId, feature.radius, feature.edgeIndices)
+  return tessToGeometry(tess)
+}
+
+async function buildChamfer(feature: ChamferFeature, activeSolidId: string | undefined): Promise<THREE.BufferGeometry> {
+  if (!activeSolidId) throw new Error(`Chamfer "${feature.id}" has no solid to chamfer`)
+  const api = await getOccApi()
+  const tess = await api.chamferShape(feature.id, activeSolidId, feature.distance, feature.edgeIndices)
   return tessToGeometry(tess)
 }
 
@@ -153,6 +192,10 @@ export async function rebuildAll(
 
   const results = new Map<string, THREE.BufferGeometry>()
 
+  // Track the ID of the most recently built solid so cut features know what to subtract from.
+  // This is a simplified single-body model; multi-body would need a more sophisticated approach.
+  let activeSolidId: string | undefined
+
   for (const feature of features) {
     if (feature.suppressed) continue
 
@@ -160,21 +203,34 @@ export async function rebuildAll(
       let geometry: THREE.BufferGeometry | null = null
 
       switch (feature.type) {
-        case 'box':
-          geometry = await buildBox(feature)
-          break
-        case 'cylinder':
-          geometry = await buildCylinder(feature)
-          break
-        case 'sphere':
-          geometry = await buildSphere(feature)
-          break
         case 'sketch':
           // Sketches don't produce visible geometry in modeling mode.
-          // They serve as input for extrude/revolve/etc.
           break
-        case 'extrude':
-          geometry = await buildExtrude(feature, features)
+        case 'extrude': {
+          const operation = feature.operation ?? 'boss'
+          geometry = await buildExtrude(feature, features, operation === 'cut' ? activeSolidId : undefined)
+
+          if (operation === 'cut' && activeSolidId) {
+            // The cut result replaces the base solid — hide the base feature's geometry
+            results.delete(activeSolidId)
+          }
+
+          activeSolidId = feature.id
+          break
+        }
+        case 'revolve':
+          geometry = await buildRevolve(feature, features)
+          activeSolidId = feature.id
+          break
+        case 'fillet':
+          geometry = await buildFillet(feature, activeSolidId)
+          if (activeSolidId) results.delete(activeSolidId)
+          activeSolidId = feature.id
+          break
+        case 'chamfer':
+          geometry = await buildChamfer(feature, activeSolidId)
+          if (activeSolidId) results.delete(activeSolidId)
+          activeSolidId = feature.id
           break
       }
 
@@ -206,14 +262,21 @@ export async function rebuildSingle(
 
   const feature = features[featureIndex]
 
+  // Cut features and features that have cuts downstream always need a full rebuild
+  // because they affect which geometry is shown for earlier features.
+  const isCut = feature.type === 'extrude' && (feature as ExtrudeFeature).operation === 'cut'
+  const hasCutDependents = features.slice(featureIndex + 1).some(
+    (f) => f.type === 'extrude' && (f as ExtrudeFeature).operation === 'cut'
+  )
+
   // Check if any later feature depends on this one
   const hasDependents = features.slice(featureIndex + 1).some((f) => {
     if (f.type === 'extrude' && (f as ExtrudeFeature).sketchId === featureId) return true
+    if (f.type === 'revolve' && (f as RevolveFeature).sketchId === featureId) return true
     return false
   })
 
-  if (hasDependents) {
-    // If there are dependents, we need a full rebuild from this point
+  if (hasDependents || isCut || hasCutDependents) {
     return rebuildAll(features)
   }
 
@@ -222,18 +285,17 @@ export async function rebuildSingle(
     let geometry: THREE.BufferGeometry | null = null
 
     switch (feature.type) {
-      case 'box':
-        geometry = await buildBox(feature)
-        break
-      case 'cylinder':
-        geometry = await buildCylinder(feature)
-        break
-      case 'sphere':
-        geometry = await buildSphere(feature)
-        break
       case 'extrude':
         geometry = await buildExtrude(feature as ExtrudeFeature, features)
         break
+      case 'revolve':
+        geometry = await buildRevolve(feature as RevolveFeature, features)
+        break
+      case 'fillet':
+        // Fillet modifies the active solid — always fall back to full rebuild
+        return rebuildAll(features)
+      case 'chamfer':
+        return rebuildAll(features)
       case 'sketch':
         break
     }
