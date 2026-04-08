@@ -1,12 +1,14 @@
-import { Canvas, useThree } from '@react-three/fiber'
+import { Canvas, useThree, useFrame } from '@react-three/fiber'
 import { OrbitControls, GizmoHelper, GizmoViewport, Grid } from '@react-three/drei'
 import { SceneObjects } from './SceneObjects'
 import { SketchRenderer } from './SketchRenderer'
 import { SketchInteraction } from './SketchInteraction'
+import { MeasurementOverlay } from './MeasurementOverlay'
 import { useOccInit } from '../hooks/useOccInit'
 import { useAppStore } from '../store/appStore'
 import { useEffect, useRef, useCallback } from 'react'
 import * as THREE from 'three'
+import { cursorWorld } from './StatusBar'
 
 // ─── Named view camera positions ────────────────────────────
 
@@ -26,6 +28,74 @@ const NAMED_VIEWS: NamedView[] = [
   { label: 'R', key: 'Right',  position: [30, 0, 0] },
   { label: 'Iso', key: 'Iso',  position: [20, 20, 20] },
 ]
+
+/**
+ * Tracks cursor position in world coordinates by raycasting against
+ * scene meshes and a ground plane. Updates the module-level cursorWorld
+ * object without triggering React re-renders.
+ */
+function CursorTracker() {
+  const { camera, raycaster, scene } = useThree()
+  const pointer = useRef(new THREE.Vector2())
+  const groundPlane = useRef(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0))
+  const intersectPoint = useRef(new THREE.Vector3())
+
+  // Track raw pointer position via native event (doesn't cause re-renders)
+  useEffect(() => {
+    const canvas = document.querySelector('canvas')
+    if (!canvas) return
+
+    function onMove(e: PointerEvent) {
+      const rect = canvas!.getBoundingClientRect()
+      pointer.current.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+      pointer.current.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+    }
+
+    function onLeave() {
+      cursorWorld.valid = false
+    }
+
+    canvas.addEventListener('pointermove', onMove)
+    canvas.addEventListener('pointerleave', onLeave)
+    return () => {
+      canvas.removeEventListener('pointermove', onMove)
+      canvas.removeEventListener('pointerleave', onLeave)
+    }
+  }, [])
+
+  // Raycast each frame (~60fps but the StatusBar only polls at rAF rate)
+  useFrame(() => {
+    raycaster.setFromCamera(pointer.current, camera)
+
+    // Try to hit scene meshes first
+    const meshes: THREE.Object3D[] = []
+    scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) meshes.push(obj)
+    })
+    const hits = raycaster.intersectObjects(meshes, false)
+
+    if (hits.length > 0) {
+      const p = hits[0].point
+      cursorWorld.x = p.x
+      cursorWorld.y = p.y
+      cursorWorld.z = p.z
+      cursorWorld.valid = true
+    } else {
+      // Fall back to ground plane (XZ at y=0)
+      const hit = raycaster.ray.intersectPlane(groundPlane.current, intersectPoint.current)
+      if (hit) {
+        cursorWorld.x = hit.x
+        cursorWorld.y = hit.y
+        cursorWorld.z = hit.z
+        cursorWorld.valid = true
+      } else {
+        cursorWorld.valid = false
+      }
+    }
+  })
+
+  return null
+}
 
 /**
  * Smoothly animates the camera to look at the sketch plane head-on.
@@ -92,6 +162,33 @@ interface CameraActions {
 
 function CameraController({ actionsRef }: { actionsRef: React.MutableRefObject<CameraActions | null> }) {
   const { camera, scene } = useThree()
+
+  // Listen for custom events from CommandPalette
+  useEffect(() => {
+    function handleNamedView(e: Event) {
+      const viewKey = (e as CustomEvent).detail as string
+      const viewMap: Record<string, { position: [number, number, number]; up?: [number, number, number] }> = {
+        front: { position: [0, 0, 30] },
+        back: { position: [0, 0, -30] },
+        top: { position: [0, 30, 0], up: [0, 0, -1] },
+        bottom: { position: [0, -30, 0], up: [0, 0, 1] },
+        left: { position: [-30, 0, 0] },
+        right: { position: [30, 0, 0] },
+        iso: { position: [20, 20, 20] },
+      }
+      const v = viewMap[viewKey]
+      if (v) actionsRef.current?.flyToView(v.position, v.up)
+    }
+    function handleZoomToFit() {
+      actionsRef.current?.zoomToFit()
+    }
+    window.addEventListener('cad:named-view', handleNamedView)
+    window.addEventListener('cad:zoom-to-fit', handleZoomToFit)
+    return () => {
+      window.removeEventListener('cad:named-view', handleNamedView)
+      window.removeEventListener('cad:zoom-to-fit', handleZoomToFit)
+    }
+  }, [actionsRef])
 
   actionsRef.current = {
     flyToView(position, up) {
@@ -175,6 +272,9 @@ function SceneContent({ cameraActionsRef }: { cameraActionsRef: React.MutableRef
       {/* Camera controller for named views / zoom-to-fit */}
       <CameraController actionsRef={cameraActionsRef} />
 
+      {/* Cursor position tracker for status bar */}
+      <CursorTracker />
+
       {/* Lighting */}
       <ambientLight intensity={0.4} />
       <directionalLight position={[10, 20, 10]} intensity={0.8} castShadow />
@@ -200,6 +300,9 @@ function SceneContent({ cameraActionsRef }: { cameraActionsRef: React.MutableRef
 
       {/* OCCT-generated scene objects */}
       <SceneObjects />
+
+      {/* Measurement annotations */}
+      <MeasurementOverlay />
 
       {/* Sketch overlay (only in sketch mode) */}
       {isSketchMode && (

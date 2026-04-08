@@ -8,6 +8,7 @@ export interface TessellationData {
   normals: Float32Array    // [nx, ny, nz, ...] — per-vertex normals
   indices: Uint32Array     // triangle indices
   faceRanges: FaceRange[]  // per-face index ranges for picking
+  edgePolylines?: number[][] // B-Rep edge polylines for "shaded with edges" display
 }
 
 export interface FaceRange {

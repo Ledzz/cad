@@ -73,6 +73,39 @@ export interface NumberInputDialogState {
   resolve: (value: number | null) => void
 }
 
+// ─── Measurement ────────────────────────────────────────────
+
+export type MeasurementMode = null | 'point-to-point' | 'edge-length' | 'face-angle'
+
+export interface MeasurementPointToPoint {
+  type: 'point-to-point'
+  p1: [number, number, number]
+  p2: [number, number, number]
+  distance: number
+}
+
+export interface MeasurementEdgeLength {
+  type: 'edge-length'
+  midpoint: [number, number, number]
+  length: number
+}
+
+export interface MeasurementFaceAngle {
+  type: 'face-angle'
+  centroid1: [number, number, number]
+  centroid2: [number, number, number]
+  angle: number
+}
+
+export type Measurement = MeasurementPointToPoint | MeasurementEdgeLength | MeasurementFaceAngle
+
+export interface MeasurementPicking {
+  /** For point-to-point: the first picked point */
+  firstPoint?: [number, number, number]
+  /** For face-angle: the first picked face */
+  firstFace?: { shapeId: string; faceIndex: number; centroid: [number, number, number] }
+}
+
 // ─── History ────────────────────────────────────────────────
 
 const MAX_HISTORY_SIZE = 50
@@ -196,6 +229,22 @@ export interface AppState {
   runSolver: (draggedPointId?: string, dragPosition?: { x: number; y: number }) => void
   /** Drag a sketch point (used during interactive drag) */
   dragSketchPoint: (pointId: string, position: { x: number; y: number }) => void
+
+  // ─── Visual Settings ──────────────────────────────────
+  /** Whether to show B-Rep edges overlaid on shaded surfaces */
+  showEdges: boolean
+  toggleShowEdges: () => void
+
+  // ─── Measurement ──────────────────────────────────────
+  measurementMode: MeasurementMode
+  /** Active measurements to display */
+  measurements: Measurement[]
+  /** Partial state while picking for a measurement */
+  measurementPicking: MeasurementPicking | null
+  setMeasurementMode: (mode: MeasurementMode) => void
+  addMeasurement: (m: Measurement) => void
+  clearMeasurements: () => void
+  setMeasurementPicking: (picking: MeasurementPicking | null) => void
 }
 
 // ─── Sketch ID counter ─────────────────────────────────────
@@ -1090,4 +1139,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().runSolver(pointId, position)
     }
   },
+
+  // ─── Visual Settings ──────────────────────────────────
+  showEdges: false,
+  toggleShowEdges: () => set((s) => ({ showEdges: !s.showEdges })),
+
+  // ─── Measurement ──────────────────────────────────────
+  measurementMode: null as MeasurementMode,
+  measurements: [] as Measurement[],
+  measurementPicking: null as MeasurementPicking | null,
+  setMeasurementMode: (mode) => set({ measurementMode: mode, measurementPicking: mode ? {} : null }),
+  addMeasurement: (m) => set((s) => ({ measurements: [...s.measurements, m] })),
+  clearMeasurements: () => set({ measurements: [], measurementMode: null, measurementPicking: null }),
+  setMeasurementPicking: (picking) => set({ measurementPicking: picking }),
 }))

@@ -5,6 +5,8 @@ import { Viewport } from './components/Viewport'
 import { PropertiesPanel } from './components/PropertiesPanel'
 import { FeaturePanel } from './components/FeaturePanel'
 import { InputDialog } from './components/InputDialog'
+import { StatusBar } from './components/StatusBar'
+import { CommandPalette } from './components/CommandPalette'
 import { useAppStore } from './store/appStore'
 import {
   getApplicableConstraints,
@@ -195,6 +197,13 @@ function useGlobalKeyboardShortcuts() {
         return
       }
 
+      // Escape: cancel measurement mode
+      if (e.key === 'Escape' && store.measurementMode) {
+        e.preventDefault()
+        store.setMeasurementMode(null)
+        return
+      }
+
       // Undo: Ctrl/Cmd+Z (without Shift)
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
         e.preventDefault()
@@ -235,8 +244,10 @@ function App() {
         <Viewport />
         <PropertiesPanel />
       </div>
+      <StatusBar />
       <FeaturePanel />
       <InputDialog />
+      <CommandPalette />
     </>
   )
 }

@@ -3,6 +3,7 @@ import * as THREE from 'three'
 import { Line } from '@react-three/drei'
 import { useAppStore } from '../store/appStore'
 import type { FaceRange } from '../engine/tessellation'
+import type { MeasurementPicking } from '../store/appStore'
 
 const OBJECT_COLOR = '#6688cc'
 const HOVER_COLOR = '#88aaee'
@@ -12,6 +13,7 @@ const FACE_HIGHLIGHT_COLOR = '#55ddaa'
 const EDGE_COLOR = '#888888'
 const EDGE_HOVER_COLOR = '#ffdd44'
 const EDGE_SELECTED_COLOR = '#ff6644'
+const BREP_EDGE_COLOR = '#222233'
 
 /**
  * Given a triangle index from a Three.js raycaster hit, find which OCCT face
@@ -145,6 +147,37 @@ function EdgeSelectionOverlay() {
 }
 
 /**
+ * Renders B-Rep edges overlaid on shaded surfaces ("shaded with edges" mode).
+ * Edge polylines come from OCCT tessellation data stored in geometry.userData.
+ */
+function BRepEdgeOverlay({ geometry }: { geometry: THREE.BufferGeometry }) {
+  const edgePolylines = geometry.userData?.edgePolylines as number[][] | undefined
+  if (!edgePolylines || edgePolylines.length === 0) return null
+
+  return (
+    <>
+      {edgePolylines.map((flat, idx) => {
+        const points: [number, number, number][] = []
+        for (let i = 0; i < flat.length; i += 3) {
+          points.push([flat[i], flat[i + 1], flat[i + 2]])
+        }
+        if (points.length < 2) return null
+        return (
+          <Line
+            key={idx}
+            points={points}
+            color={BREP_EDGE_COLOR}
+            lineWidth={1}
+            depthTest
+            renderOrder={2}
+          />
+        )
+      })}
+    </>
+  )
+}
+
+/**
  * Renders all scene objects from the app store as Three.js meshes.
  * In sketch mode, objects are dimmed with transparency.
  * In face selection mode, individual faces can be hovered and clicked.
@@ -160,10 +193,107 @@ export function SceneObjects() {
   const setHoveredFace = useAppStore((s) => s.setHoveredFace)
   const selectFaceForSketch = useAppStore((s) => s.selectFaceForSketch)
   const edgeSelection = useAppStore((s) => s.edgeSelection)
+  const showEdges = useAppStore((s) => s.showEdges)
+  const measurementMode = useAppStore((s) => s.measurementMode)
+  const measurementPicking = useAppStore((s) => s.measurementPicking)
+  const addMeasurement = useAppStore((s) => s.addMeasurement)
+  const setMeasurementPicking = useAppStore((s) => s.setMeasurementPicking)
+  const setMeasurementMode = useAppStore((s) => s.setMeasurementMode)
 
   const isSketchMode = mode === 'sketching'
   const isFaceSelectionMode = selectingSketchFace && !isSketchMode
   const isEdgeSelectionMode = edgeSelection?.active ?? false
+  const isMeasurementMode = measurementMode !== null && !isSketchMode
+
+  /** Handle measurement picks */
+  const handleMeasurementClick = async (
+    e: any,
+    featureId: string,
+    geometry: THREE.BufferGeometry,
+    faceRanges: FaceRange[] | undefined
+  ) => {
+    if (!measurementMode) return
+
+    if (measurementMode === 'point-to-point') {
+      const point: [number, number, number] = [e.point.x, e.point.y, e.point.z]
+      if (!measurementPicking?.firstPoint) {
+        setMeasurementPicking({ firstPoint: point })
+      } else {
+        const p1 = measurementPicking.firstPoint
+        const dx = point[0] - p1[0]
+        const dy = point[1] - p1[1]
+        const dz = point[2] - p1[2]
+        const distance = Math.sqrt(dx * dx + dy * dy + dz * dz)
+        addMeasurement({ type: 'point-to-point', p1, p2: point, distance })
+        setMeasurementMode(null)
+      }
+    } else if (measurementMode === 'edge-length') {
+      // Edge-length measurement: find the nearest edge from edgePolylines
+      const edgePolylines = geometry.userData?.edgePolylines as number[][] | undefined
+      if (!edgePolylines || edgePolylines.length === 0) return
+
+      // Find closest edge to click point
+      const clickPt = e.point as THREE.Vector3
+      let bestEdgeIdx = 0
+      let bestDist = Infinity
+      for (let ei = 0; ei < edgePolylines.length; ei++) {
+        const flat = edgePolylines[ei]
+        for (let i = 0; i < flat.length; i += 3) {
+          const dx = flat[i] - clickPt.x
+          const dy = flat[i + 1] - clickPt.y
+          const dz = flat[i + 2] - clickPt.z
+          const d = dx * dx + dy * dy + dz * dz
+          if (d < bestDist) { bestDist = d; bestEdgeIdx = ei }
+        }
+      }
+
+      try {
+        const { getOccApi } = await import('../workers/occApi')
+        const api = await getOccApi()
+        const length = await api.getEdgeLength(featureId, bestEdgeIdx)
+        const midpoint = await api.getEdgeMidpoint(featureId, bestEdgeIdx)
+        addMeasurement({ type: 'edge-length', midpoint: midpoint as [number, number, number], length })
+        setMeasurementMode(null)
+      } catch (err) {
+        console.error('[Measurement] Edge length failed:', err)
+      }
+    } else if (measurementMode === 'face-angle') {
+      if (!faceRanges || e.faceIndex == null) return
+      const face = findFaceFromTriIndex(e.faceIndex, faceRanges)
+      if (!face) return
+
+      try {
+        const { getOccApi } = await import('../workers/occApi')
+        const api = await getOccApi()
+        const centroid = await api.getFaceCentroid(featureId, face.faceIndex)
+
+        if (!measurementPicking?.firstFace) {
+          setMeasurementPicking({
+            firstFace: {
+              shapeId: featureId,
+              faceIndex: face.faceIndex,
+              centroid: centroid as [number, number, number],
+            },
+          })
+        } else {
+          const angle = await api.getAngleBetweenFaces(
+            measurementPicking.firstFace.shapeId,
+            measurementPicking.firstFace.faceIndex,
+            face.faceIndex
+          )
+          addMeasurement({
+            type: 'face-angle',
+            centroid1: measurementPicking.firstFace.centroid,
+            centroid2: centroid as [number, number, number],
+            angle,
+          })
+          setMeasurementMode(null)
+        }
+      } catch (err) {
+        console.error('[Measurement] Face angle failed:', err)
+      }
+    }
+  }
 
   return (
     <>
@@ -208,6 +338,8 @@ export function SceneObjects() {
                     }
                   }
                   document.body.style.cursor = 'crosshair'
+                } else if (isMeasurementMode) {
+                  document.body.style.cursor = 'crosshair'
                 } else {
                   setHovered(id)
                   document.body.style.cursor = 'pointer'
@@ -238,6 +370,11 @@ export function SceneObjects() {
               onClick={(e) => {
                 if (isSketchMode) return
                 e.stopPropagation()
+
+                if (isMeasurementMode) {
+                  handleMeasurementClick(e, id, geometry, faceRanges)
+                  return
+                }
 
                 if (isFaceSelectionMode) {
                   // Face-level selection
@@ -273,6 +410,11 @@ export function SceneObjects() {
             {/* Face highlight overlay */}
             {hoveredFaceRange && (
               <FaceHighlight geometry={geometry} faceRange={hoveredFaceRange} />
+            )}
+
+            {/* B-Rep edge overlay (shaded with edges mode) */}
+            {showEdges && !isSketchMode && (
+              <BRepEdgeOverlay geometry={geometry} />
             )}
           </group>
         )

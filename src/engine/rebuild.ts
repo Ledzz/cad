@@ -20,7 +20,10 @@ function tessToGeometry(tess: TessellationData): THREE.BufferGeometry {
   geometry.setAttribute('position', new THREE.BufferAttribute(tess.vertices, 3))
   geometry.setAttribute('normal', new THREE.BufferAttribute(tess.normals, 3))
   geometry.setIndex(new THREE.BufferAttribute(tess.indices, 1))
-  geometry.userData = { faceRanges: tess.faceRanges }
+  geometry.userData = {
+    faceRanges: tess.faceRanges,
+    edgePolylines: tess.edgePolylines ?? [],
+  }
   return geometry
 }
 

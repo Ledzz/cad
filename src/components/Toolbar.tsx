@@ -60,6 +60,12 @@ export function Toolbar() {
   const openNumberInput = useAppStore((s) => s.openNumberInput)
   const openFeaturePanelCreate = useAppStore((s) => s.openFeaturePanelCreate)
   const featurePanel = useAppStore((s) => s.featurePanel)
+  const showEdges = useAppStore((s) => s.showEdges)
+  const toggleShowEdges = useAppStore((s) => s.toggleShowEdges)
+  const measurementMode = useAppStore((s) => s.measurementMode)
+  const setMeasurementMode = useAppStore((s) => s.setMeasurementMode)
+  const clearMeasurements = useAppStore((s) => s.clearMeasurements)
+  const measurements = useAppStore((s) => s.measurements)
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -461,6 +467,62 @@ export function Toolbar() {
               Click a planar face...
             </span>
           )}
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+          {/* Visual toggle: shaded with edges */}
+          <button
+            className={showEdges ? buttonActive : buttonIdle}
+            onClick={toggleShowEdges}
+            title="Toggle edge display (shaded with edges)"
+          >
+            Edges
+          </button>
+
+          <div className="w-px h-5 bg-[#2a2a4a] mx-1" />
+
+          {/* Measurement tools */}
+          <button
+            className={measurementMode === 'point-to-point' ? buttonActive : buttonIdle}
+            onClick={() => setMeasurementMode(measurementMode === 'point-to-point' ? null : 'point-to-point')}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Measure point-to-point distance (click two points)"
+          >
+            P2P
+          </button>
+          <button
+            className={measurementMode === 'edge-length' ? buttonActive : buttonIdle}
+            onClick={() => setMeasurementMode(measurementMode === 'edge-length' ? null : 'edge-length')}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Measure edge length (click an edge)"
+          >
+            Edge
+          </button>
+          <button
+            className={measurementMode === 'face-angle' ? buttonActive : buttonIdle}
+            onClick={() => setMeasurementMode(measurementMode === 'face-angle' ? null : 'face-angle')}
+            disabled={isBusy || sceneObjects.size === 0}
+            title="Measure angle between faces (click two faces)"
+          >
+            Angle
+          </button>
+          {measurements.length > 0 && (
+            <button
+              className={`${buttonBase} text-red-400 hover:text-red-300 hover:bg-red-900/30`}
+              onClick={clearMeasurements}
+              title="Clear all measurements"
+            >
+              Clear
+            </button>
+          )}
+          {measurementMode && (
+            <span className="text-xs text-orange-400 ml-1 animate-pulse">
+              {measurementMode === 'point-to-point' ? 'Click two points...' :
+               measurementMode === 'edge-length' ? 'Click an edge...' :
+               'Click two faces...'}
+            </span>
+          )}
+
           {isRebuilding && (
             <span className="text-xs text-yellow-400 ml-2 animate-pulse">
               Rebuilding...

@@ -164,16 +164,58 @@ function tessellateShape(shape: TopoDSShape, id: string, linearDeflection = 0.1,
     }
   }
 
+  // Collect B-Rep edge polylines for "shaded with edges" display
+  const edgePolylines = collectEdgePolylines(shape)
+
   return {
     id,
     vertices: new Float32Array(allVertices),
     normals: new Float32Array(allNormals),
     indices: new Uint32Array(allIndices),
     faceRanges,
+    edgePolylines,
   }
 }
 
 // ─── Helpers ────────────────────────────────────────────────
+
+/**
+ * Collect edge polylines from a shape for "shaded with edges" display.
+ * Reuses collectUniqueEdges for deduplication, then samples each edge curve.
+ */
+function collectEdgePolylines(shape: TopoDSShape): number[][] {
+  if (!oc) return []
+  const uniqueEdges = collectUniqueEdges(shape)
+  const edgePolylines: number[][] = []
+  const NUM_SAMPLES = 32
+
+  for (const edgeShape of uniqueEdges) {
+    try {
+      const edge = oc.TopoDS.Edge_1(edgeShape)
+      const adaptor = new oc.BRepAdaptor_Curve_2(edge)
+      const u0: number = adaptor.FirstParameter()
+      const u1: number = adaptor.LastParameter()
+
+      const points: number[] = []
+      for (let i = 0; i <= NUM_SAMPLES; i++) {
+        const u = u0 + (u1 - u0) * (i / NUM_SAMPLES)
+        const pnt = adaptor.Value(u)
+        points.push(pnt.X(), pnt.Y(), pnt.Z())
+        pnt.delete()
+      }
+
+      adaptor.delete()
+
+      if (points.length >= 6) {
+        edgePolylines.push(points)
+      }
+    } catch {
+      // Skip degenerate edges
+    }
+  }
+
+  return edgePolylines
+}
 
 /**
  * Get the last stored shape from the registry (the final solid in the feature chain).
@@ -1112,6 +1154,171 @@ const occWorkerApi = {
     }
 
     return { edges }
+  },
+
+  // ─── Measurement ────────────────────────────────────────────
+
+  /**
+   * Get the exact length of an edge using BRepGProp.LinearProperties.
+   * @param shapeId - The shape ID in the registry
+   * @param edgeIndex - The 0-based edge index (from collectUniqueEdges ordering)
+   */
+  getEdgeLength(shapeId: string, edgeIndex: number): number {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    const uniqueEdges = collectUniqueEdges(shape)
+    if (edgeIndex < 0 || edgeIndex >= uniqueEdges.length) {
+      throw new Error(`Edge index ${edgeIndex} out of range (${uniqueEdges.length} edges)`)
+    }
+
+    const edge = uniqueEdges[edgeIndex]
+    const props = new oc.GProp_GProps_1()
+    try {
+      oc.BRepGProp.LinearProperties(edge, props, false, false)
+      return props.Mass()
+    } finally {
+      props.delete()
+    }
+  },
+
+  /**
+   * Get the angle between two faces' normals using gp_Dir.Angle().
+   * @param shapeId - The shape ID in the registry
+   * @param faceIndex1 - First face index (from tessellation faceRanges)
+   * @param faceIndex2 - Second face index
+   * @returns Angle in degrees between the two face normals
+   */
+  getAngleBetweenFaces(shapeId: string, faceIndex1: number, faceIndex2: number): number {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    function getFaceNormal(faceIdx: number): { nx: number; ny: number; nz: number } {
+      const explorer = new oc!.TopExp_Explorer_2(
+        shape!,
+        oc!.TopAbs_ShapeEnum.TopAbs_FACE,
+        oc!.TopAbs_ShapeEnum.TopAbs_SHAPE
+      )
+      let idx = 0
+      while (explorer.More()) {
+        if (idx === faceIdx) {
+          const face = oc!.TopoDS.Face_1(explorer.Current())
+          const isReversed = face.Orientation_1() === oc!.TopAbs_Orientation.TopAbs_REVERSED
+          const adaptor = new oc!.BRepAdaptor_Surface_2(face, true)
+
+          // Get the surface normal at mid-UV point
+          const uMin = adaptor.FirstUParameter()
+          const uMax = adaptor.LastUParameter()
+          const vMin = adaptor.FirstVParameter()
+          const vMax = adaptor.LastVParameter()
+          const uMid = (uMin + uMax) / 2
+          const vMid = (vMin + vMax) / 2
+
+          const pnt = new oc!.gp_Pnt_1()
+          const d1u = new oc!.gp_Vec_1()
+          const d1v = new oc!.gp_Vec_1()
+          adaptor.D1(uMid, vMid, pnt, d1u, d1v)
+
+          // Normal = d1u × d1v
+          const normal = d1u.Crossed(d1v)
+          let nx = normal.X(), ny = normal.Y(), nz = normal.Z()
+          const len = Math.sqrt(nx * nx + ny * ny + nz * nz)
+          if (len > 1e-10) { nx /= len; ny /= len; nz /= len }
+
+          if (isReversed) { nx = -nx; ny = -ny; nz = -nz }
+
+          pnt.delete(); d1u.delete(); d1v.delete(); normal.delete()
+          adaptor.delete()
+          explorer.delete()
+          return { nx, ny, nz }
+        }
+        idx++
+        explorer.Next()
+      }
+      explorer.delete()
+      throw new Error(`Face index ${faceIdx} not found in shape "${shapeId}"`)
+    }
+
+    const n1 = getFaceNormal(faceIndex1)
+    const n2 = getFaceNormal(faceIndex2)
+
+    const dir1 = new oc.gp_Dir_4(n1.nx, n1.ny, n1.nz)
+    const dir2 = new oc.gp_Dir_4(n2.nx, n2.ny, n2.nz)
+    try {
+      const angleRad = dir1.Angle(dir2)
+      return (angleRad * 180) / Math.PI
+    } finally {
+      dir1.delete()
+      dir2.delete()
+    }
+  },
+
+  /**
+   * Get the midpoint of an edge (for annotation placement).
+   * @param shapeId - Shape ID in registry
+   * @param edgeIndex - 0-based edge index
+   */
+  getEdgeMidpoint(shapeId: string, edgeIndex: number): [number, number, number] {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    const uniqueEdges = collectUniqueEdges(shape)
+    if (edgeIndex < 0 || edgeIndex >= uniqueEdges.length) {
+      throw new Error(`Edge index ${edgeIndex} out of range`)
+    }
+
+    const edge = oc.TopoDS.Edge_1(uniqueEdges[edgeIndex])
+    const adaptor = new oc.BRepAdaptor_Curve_2(edge)
+    try {
+      const u0: number = adaptor.FirstParameter()
+      const u1: number = adaptor.LastParameter()
+      const uMid = (u0 + u1) / 2
+      const pnt = adaptor.Value(uMid)
+      const result: [number, number, number] = [pnt.X(), pnt.Y(), pnt.Z()]
+      pnt.delete()
+      return result
+    } finally {
+      adaptor.delete()
+    }
+  },
+
+  /**
+   * Get the centroid of a face (for annotation placement).
+   */
+  getFaceCentroid(shapeId: string, faceIndex: number): [number, number, number] {
+    if (!oc) throw new Error('OpenCascade not initialized')
+
+    const shape = shapeRegistry.get(shapeId)
+    if (!shape) throw new Error(`Shape "${shapeId}" not found in registry`)
+
+    const explorer = new oc.TopExp_Explorer_2(
+      shape,
+      oc.TopAbs_ShapeEnum.TopAbs_FACE,
+      oc.TopAbs_ShapeEnum.TopAbs_SHAPE
+    )
+    let idx = 0
+    while (explorer.More()) {
+      if (idx === faceIndex) {
+        const face = oc.TopoDS.Face_1(explorer.Current())
+        const props = new oc.GProp_GProps_1()
+        oc.BRepGProp.SurfaceProperties_1(face, props, false, false)
+        const center = props.CentreOfMass()
+        const result: [number, number, number] = [center.X(), center.Y(), center.Z()]
+        props.delete()
+        explorer.delete()
+        return result
+      }
+      idx++
+      explorer.Next()
+    }
+    explorer.delete()
+    throw new Error(`Face index ${faceIndex} not found`)
   },
 
   // ─── File I/O ──────────────────────────────────────────────
