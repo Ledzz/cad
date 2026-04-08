@@ -5,11 +5,8 @@ import type { SketchConstraint } from '../engine/sketchTypes'
 import {
   generateFeatureId,
   snapshotSketch,
+  createDefaultFeature,
   type SketchFeature,
-  type ExtrudeFeature,
-  type RevolveFeature,
-  type FilletFeature,
-  type ChamferFeature,
 } from '../engine/featureTypes'
 import {
   getApplicableConstraints,
@@ -44,8 +41,6 @@ export function Toolbar() {
   const exitSketchMode = useAppStore((s) => s.exitSketchMode)
   const confirmSketchEdit = useAppStore((s) => s.confirmSketchEdit)
   const setActiveSketchTool = useAppStore((s) => s.setActiveSketchTool)
-  const addFeatures = useAppStore((s) => s.addFeatures)
-  const addFeature = useAppStore((s) => s.addFeature)
   const addConstraint = useAppStore((s) => s.addConstraint)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
   const undo = useAppStore((s) => s.undo)
@@ -62,8 +57,9 @@ export function Toolbar() {
   const edgeSelection = useAppStore((s) => s.edgeSelection)
   const startEdgeSelection = useAppStore((s) => s.startEdgeSelection)
   const cancelEdgeSelection = useAppStore((s) => s.cancelEdgeSelection)
-  const confirmEdgeSelection = useAppStore((s) => s.confirmEdgeSelection)
-  const [extruding, setExtruding] = useState(false)
+  const openNumberInput = useAppStore((s) => s.openNumberInput)
+  const openFeaturePanelCreate = useAppStore((s) => s.openFeaturePanelCreate)
+  const featurePanel = useAppStore((s) => s.featurePanel)
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -79,10 +75,10 @@ export function Toolbar() {
     ? getApplicableConstraints(selectedIds, entities)
     : []
 
-  const handleApplyConstraint = (constraintType: SketchConstraint['type']) => {
+  const handleApplyConstraint = async (constraintType: SketchConstraint['type']) => {
     if (!activeSketch) return
 
-    // For dimensional constraints, prompt for value
+    // For dimensional constraints, ask for value via input dialog
     const needsValue = ['distance', 'horizontalDistance', 'verticalDistance', 'angle', 'radius'].includes(constraintType)
     let value: number | undefined
 
@@ -97,10 +93,9 @@ export function Toolbar() {
       if (constraint && 'value' in constraint) {
         const label = constraintType === 'angle' ? 'Angle (degrees)' : 'Value'
         const defaultVal = Math.round((constraint as any).value * 1000) / 1000
-        const input = prompt(`${label}:`, String(defaultVal))
-        if (input === null) return
-        value = parseFloat(input)
-        if (isNaN(value)) return
+        const result = await openNumberInput(label, defaultVal)
+        if (result === null) return
+        value = result
       }
     }
 
@@ -117,7 +112,8 @@ export function Toolbar() {
     }
   }
 
-  const handleFinishAndExtrude = async (operation: 'boss' | 'cut' = 'boss') => {
+  /** Save the current sketch and open the feature panel to create an extrude or revolve */
+  const handleFinishAndCreateFeature = async (featureType: 'extrude' | 'revolve', operation?: 'boss' | 'cut') => {
     if (!activeSketch) return
 
     // Count non-point, non-construction entities
@@ -126,111 +122,41 @@ export function Toolbar() {
     )
 
     if (!hasProfile) {
-      // No edges to extrude — just exit sketch mode
       exitSketchMode()
       return
     }
 
-    const distStr = prompt('Extrude distance:', '5')
-    if (!distStr) return
-    const distance = parseFloat(distStr)
-    if (isNaN(distance) || distance === 0) return
-
-    setExtruding(true)
-    try {
-      if (isEditingExisting) {
-        // Updating existing sketch + keeping/creating extrude
-        // First save the sketch edits
-        const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints)
-        const { updateFeature } = useAppStore.getState()
-        await updateFeature(editingSketchFeatureId, { sketch: snapshot } as Partial<SketchFeature>)
-
-        exitSketchMode()
-      } else {
-        // Create a SketchFeature (snapshot of current sketch)
-        const sketchId = generateFeatureId('sketch')
-        const sketchFeature: SketchFeature = {
-          id: sketchId,
-          name: `Sketch (${activeSketch.plane.name})`,
-          type: 'sketch',
-          suppressed: false,
-          sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
-        }
-
-        // Create an ExtrudeFeature referencing the sketch
-        const extrudeId = generateFeatureId('extrude')
-        const label = operation === 'cut' ? 'Cut' : 'Extrude'
-        const extrudeFeature: ExtrudeFeature = {
-          id: extrudeId,
-          name: `${label} (${Math.abs(distance)}mm)`,
-          type: 'extrude',
-          suppressed: false,
-          sketchId,
-          distance: Math.abs(distance),
-          direction: distance > 0 ? 'normal' : 'reverse',
-          operation,
-        }
-
-        // Add both features and rebuild
-        await addFeatures([sketchFeature, extrudeFeature])
-        exitSketchMode()
-      }
-    } catch (err) {
-      console.error('[Toolbar] Extrude failed:', err)
-      alert(`Extrude failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
-    } finally {
-      setExtruding(false)
-    }
-  }
-
-  const handleFinishAndRevolve = async () => {
-    if (!activeSketch) return
-
-    const hasProfile = Array.from(activeSketch.entities.values()).some(
-      (e) => e.type !== 'point' && !e.construction
-    )
-    if (!hasProfile) { exitSketchMode(); return }
-
-    const axisStr = prompt('Revolve axis (X, Y, or Z):', 'Y')
-    if (!axisStr) return
-    const axis = axisStr.trim().toUpperCase() as 'X' | 'Y' | 'Z'
-    if (!['X', 'Y', 'Z'].includes(axis)) { alert('Axis must be X, Y, or Z'); return }
-
-    const angleStr = prompt('Angle (degrees, 1–360):', '360')
-    if (!angleStr) return
-    const angle = parseFloat(angleStr)
-    if (isNaN(angle) || angle <= 0 || angle > 360) { alert('Angle must be between 1 and 360'); return }
-
-    setExtruding(true)
-    try {
-      const sketchId = generateFeatureId('sketch')
-      const sketchFeature: SketchFeature = {
-        id: sketchId,
-        name: `Sketch (${activeSketch.plane.name})`,
-        type: 'sketch',
-        suppressed: false,
-        sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
-      }
-
-      const revolveId = generateFeatureId('revolve')
-      const revolveFeature: RevolveFeature = {
-        id: revolveId,
-        name: `Revolve ${angle}° (${axis})`,
-        type: 'revolve',
-        suppressed: false,
-        sketchId,
-        axis,
-        angle,
-      }
-
-      await addFeatures([sketchFeature, revolveFeature])
+    if (isEditingExisting) {
+      // Updating existing sketch — just save edits and open panel for any downstream feature
+      const snapshot = snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints)
+      const { updateFeature } = useAppStore.getState()
+      await updateFeature(editingSketchFeatureId, { sketch: snapshot } as Partial<SketchFeature>)
       exitSketchMode()
-    } catch (err) {
-      console.error('[Toolbar] Revolve failed:', err)
-      alert(`Revolve failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
-    } finally {
-      setExtruding(false)
+      return
     }
+
+    // Create a SketchFeature (snapshot of current sketch)
+    const sketchId = generateFeatureId('sketch')
+    const sketchFeature: SketchFeature = {
+      id: sketchId,
+      name: `Sketch (${activeSketch.plane.name})`,
+      type: 'sketch',
+      suppressed: false,
+      sketch: snapshotSketch(activeSketch.plane, activeSketch.entities, activeSketch.constraints),
+    }
+
+    // Create a default feature with the sketch reference
+    const featureId = generateFeatureId(featureType)
+    const feature = createDefaultFeature(featureType, featureId, { sketchId, operation })
+
+    // First add the sketch feature to the store directly (not through the panel)
+    const store = useAppStore.getState()
+    const featuresWithSketch = [...store.features, sketchFeature]
+    store._setFeaturesRaw(featuresWithSketch)
+
+    // Exit sketch mode, then open the feature panel in create mode
+    exitSketchMode()
+    await openFeaturePanelCreate(feature, sketchId)
   }
 
   const handleFinishSketch = async () => {
@@ -263,46 +189,19 @@ export function Toolbar() {
 
   const handleConfirmEdges = async () => {
     if (!edgeSelection) return
-    const label = edgeSelection.operation === 'fillet' ? 'Fillet radius' : 'Chamfer distance'
-    const defaultVal = edgeSelection.operation === 'fillet' ? '0.5' : '0.5'
-    const input = prompt(`${label}:`, defaultVal)
-    if (!input) return
-    const value = parseFloat(input)
-    if (isNaN(value) || value <= 0) return
-    await confirmEdgeSelection(value)
+    const edgeIndices = [...edgeSelection.selectedEdgeIndices]
+    const operation = edgeSelection.operation
+    cancelEdgeSelection()
+    const id = generateFeatureId(operation)
+    const feature = createDefaultFeature(operation, id, { edgeIndices })
+    await openFeaturePanelCreate(feature)
   }
 
   const handleApplyAllEdges = async (operation: 'fillet' | 'chamfer') => {
-    const label = operation === 'fillet' ? 'Fillet radius' : 'Chamfer distance'
-    const input = prompt(`${label} (all edges):`, '0.5')
-    if (!input) return
-    const value = parseFloat(input)
-    if (isNaN(value) || value <= 0) return
-
+    cancelEdgeSelection()
     const id = generateFeatureId(operation)
-    if (operation === 'fillet') {
-      const feature: FilletFeature = {
-        id,
-        name: `Fillet (r${value})`,
-        type: 'fillet',
-        suppressed: false,
-        radius: value,
-      }
-      try { await addFeature(feature) } catch (err) {
-        alert(`Fillet failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
-      }
-    } else {
-      const feature: ChamferFeature = {
-        id,
-        name: `Chamfer (d${value})`,
-        type: 'chamfer',
-        suppressed: false,
-        distance: value,
-      }
-      try { await addFeature(feature) } catch (err) {
-        alert(`Chamfer failed: ${err instanceof Error ? err.message : 'Unknown error'}`)
-      }
-    }
+    const feature = createDefaultFeature(operation, id)
+    await openFeaturePanelCreate(feature)
   }
 
   const handleSave = () => {
@@ -387,7 +286,7 @@ export function Toolbar() {
     }
   }
 
-  const isBusy = extruding || isRebuilding || loading || exporting
+  const isBusy = isRebuilding || loading || exporting || featurePanel !== null
 
   return (
     <div className="h-10 bg-[#16162a] border-b border-[#2a2a4a] flex items-center px-3 gap-2 shrink-0">
@@ -638,26 +537,26 @@ export function Toolbar() {
 
           <button
             className={`${buttonBase} text-purple-400 hover:text-purple-300 hover:bg-purple-900/30`}
-            onClick={() => handleFinishAndExtrude('boss')}
+            onClick={() => handleFinishAndCreateFeature('extrude', 'boss')}
             disabled={isBusy}
           >
-            {extruding ? 'Extruding...' : 'Extrude'}
+            Extrude
           </button>
           <button
             className={`${buttonBase} text-orange-400 hover:text-orange-300 hover:bg-orange-900/30`}
-            onClick={() => handleFinishAndExtrude('cut')}
+            onClick={() => handleFinishAndCreateFeature('extrude', 'cut')}
             disabled={isBusy}
             title="Cut Extrude — subtract material from existing solid"
           >
-            {extruding ? 'Cutting...' : 'Cut'}
+            Cut
           </button>
           <button
             className={`${buttonBase} text-teal-400 hover:text-teal-300 hover:bg-teal-900/30`}
-            onClick={handleFinishAndRevolve}
+            onClick={() => handleFinishAndCreateFeature('revolve')}
             disabled={isBusy}
             title="Revolve — rotate profile around a world axis"
           >
-            {extruding ? 'Revolving...' : 'Revolve'}
+            Revolve
           </button>
           <button
             className={`${buttonBase} text-green-400 hover:text-green-300 hover:bg-green-900/30`}
@@ -719,8 +618,6 @@ function ConstraintButtons({
 
   const applicableSet = new Set(applicable)
 
-  // Only show buttons that have a chance of being applicable (i.e., if there's a selection)
-  // To keep the toolbar clean, show all buttons but dim the inapplicable ones
   return (
     <>
       {allConstraints.map((type) => {

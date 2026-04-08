@@ -83,10 +83,10 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
   const toggleSuppression = useAppStore((s) => s.toggleSuppression)
   const removeFeature = useAppStore((s) => s.removeFeature)
   const reorderFeature = useAppStore((s) => s.reorderFeature)
-  const setEditingFeature = useAppStore((s) => s.setEditingFeature)
+  const openFeaturePanelEdit = useAppStore((s) => s.openFeaturePanelEdit)
   const editSketch = useAppStore((s) => s.editSketch)
 
-  const hasEditableParams = feature.type === 'extrude'
+  const hasEditableParams = feature.type === 'extrude' || feature.type === 'revolve' || feature.type === 'fillet' || feature.type === 'chamfer'
   const isSketch = feature.type === 'sketch'
 
   useEffect(() => {
@@ -129,7 +129,7 @@ function ContextMenu({ feature, x, y, onClose, featureIndex, totalFeatures }: Co
     items.push({
       label: 'Edit Parameters...',
       action: () => {
-        setEditingFeature({ featureId: feature.id })
+        openFeaturePanelEdit(feature.id)
         onClose()
       },
     })
@@ -202,7 +202,7 @@ export function FeatureTree() {
   const selection = useAppStore((s) => s.selection)
   const setSelection = useAppStore((s) => s.setSelection)
   const renameFeature = useAppStore((s) => s.renameFeature)
-  const setEditingFeature = useAppStore((s) => s.setEditingFeature)
+  const openFeaturePanelEdit = useAppStore((s) => s.openFeaturePanelEdit)
   const editSketch = useAppStore((s) => s.editSketch)
   const isRebuilding = useAppStore((s) => s.isRebuilding)
 
@@ -248,7 +248,7 @@ export function FeatureTree() {
                     editSketch(feature.id)
                   } else {
                     // For other features, open parameter edit dialog
-                    setEditingFeature({ featureId: feature.id })
+                    openFeaturePanelEdit(feature.id)
                   }
                 }}
                 onContextMenu={(e) => {

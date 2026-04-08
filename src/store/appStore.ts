@@ -12,7 +12,7 @@ import {
   generateEntityId,
 } from '../engine/sketchTypes'
 import type { Feature, SketchFeature } from '../engine/featureTypes'
-import { generateFeatureId, restoreSketchEntities, snapshotSketch } from '../engine/featureTypes'
+import { generateFeatureId, restoreSketchEntities, snapshotSketch, type CreatableFeatureType, createDefaultFeature } from '../engine/featureTypes'
 import { rebuildAll } from '../engine/rebuild'
 import { solveConstraints, getConstraintReferencedIds } from '../engine/constraintSolver'
 
@@ -51,10 +51,26 @@ export interface EdgeSelectionState {
   hoveredEdgeIndex: number | null
 }
 
-// ─── Feature editing state ──────────────────────────────────
+// ─── Feature panel state (unified create + edit) ────────────
 
-export interface EditingFeature {
-  featureId: string
+export interface FeaturePanelState {
+  /** Whether we're creating a new feature or editing an existing one */
+  mode: 'create' | 'edit'
+  /** The feature being created/edited (live-updated for preview) */
+  feature: Feature
+  /** Snapshot of the features list before the panel opened (for cancel/revert) */
+  snapshotFeatures: Feature[]
+  /** If creating extrude/revolve, the sketch feature ID that was also created (removed on cancel) */
+  createdSketchId?: string
+}
+
+// ─── Input dialog state (for constraint value input) ────────
+
+export interface NumberInputDialogState {
+  type: 'number'
+  label: string
+  defaultValue: number
+  resolve: (value: number | null) => void
 }
 
 // ─── History ────────────────────────────────────────────────
@@ -119,10 +135,26 @@ export interface AppState {
   isRebuilding: boolean
   /** Replace all features with the given list and rebuild (used for load). */
   loadProject: (features: Feature[]) => Promise<void>
+  /** Set the features list directly without pushing history or rebuilding. */
+  _setFeaturesRaw: (features: Feature[]) => void
 
-  // ─── Feature editing ────────────────────────────────────
-  editingFeature: EditingFeature | null
-  setEditingFeature: (editing: EditingFeature | null) => void
+  // ─── Feature panel (unified create + edit) ──────────────
+  featurePanel: FeaturePanelState | null
+  /** Open the panel in create mode — adds feature to list immediately for live preview */
+  openFeaturePanelCreate: (feature: Feature, createdSketchId?: string) => Promise<void>
+  /** Open the panel in edit mode — snapshots current state for cancel/revert */
+  openFeaturePanelEdit: (featureId: string) => void
+  /** Update a param on the panel's feature and trigger a live rebuild */
+  updateFeaturePanelParam: (key: string, value: string | number) => Promise<void>
+  /** Commit (accept) the panel: push undo history and close */
+  commitFeaturePanel: () => void
+  /** Cancel the panel: revert to snapshot and close */
+  cancelFeaturePanel: () => Promise<void>
+
+  // ─── Constraint value input (small dialog) ─────────────
+  inputDialog: NumberInputDialogState | null
+  openNumberInput: (label: string, defaultValue: number) => Promise<number | null>
+  closeInputDialog: () => void
 
   // Scene objects (tessellated meshes — derived from features via rebuild)
   sceneObjects: Map<string, THREE.BufferGeometry>
@@ -172,6 +204,23 @@ let sketchCounter = 0
 
 // ─── Rebuild helper ─────────────────────────────────────────
 
+/** Generate an auto-name for a feature based on its params */
+function generateFeatureName(feature: Feature): string {
+  switch (feature.type) {
+    case 'extrude': {
+      const label = feature.operation === 'cut' ? 'Cut' : 'Extrude'
+      return `${label} (${feature.distance}mm)`
+    }
+    case 'revolve':
+      return `Revolve ${feature.angle}° (${feature.axis})`
+    case 'fillet':
+      return `Fillet (r${feature.radius})`
+    case 'chamfer':
+      return `Chamfer (d${feature.distance})`
+    default:
+      return feature.name
+  }
+}
 async function performRebuild(
   features: Feature[],
   set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void
@@ -503,10 +552,99 @@ export const useAppStore = create<AppState>((set, get) => ({
     await performRebuild(features, set)
   },
 
-  // ─── Feature editing ───────────────────────────────────
+  _setFeaturesRaw: (features) => {
+    set({ features })
+  },
 
-  editingFeature: null,
-  setEditingFeature: (editing) => set({ editingFeature: editing }),
+  // ─── Feature panel (unified create + edit) ──────────────
+
+  featurePanel: null,
+
+  openFeaturePanelCreate: async (feature, createdSketchId) => {
+    const snapshotFeatures = [...get().features]
+    // Add the new feature to the list immediately for live preview
+    const features = [...snapshotFeatures, feature]
+    set({
+      featurePanel: { mode: 'create', feature, snapshotFeatures, createdSketchId },
+      features,
+    })
+    await performRebuild(features, set)
+  },
+
+  openFeaturePanelEdit: (featureId) => {
+    const feature = get().features.find((f) => f.id === featureId)
+    if (!feature || feature.type === 'sketch') return
+    set({
+      featurePanel: {
+        mode: 'edit',
+        feature: { ...feature },
+        snapshotFeatures: [...get().features],
+      },
+    })
+  },
+
+  updateFeaturePanelParam: async (key, value) => {
+    const panel = get().featurePanel
+    if (!panel) return
+
+    const updatedFeature = { ...panel.feature, [key]: value } as Feature
+    // Update the feature in the features list and rebuild
+    const features = get().features.map((f) =>
+      f.id === updatedFeature.id ? updatedFeature : f
+    )
+    set({
+      featurePanel: { ...panel, feature: updatedFeature },
+      features,
+    })
+    await performRebuild(features, set)
+  },
+
+  commitFeaturePanel: () => {
+    const panel = get().featurePanel
+    if (!panel) return
+    // Push the snapshot as undo history (so undo reverts to before the panel opened)
+    const { history } = get()
+    const newHistory = [...history, panel.snapshotFeatures]
+    if (newHistory.length > MAX_HISTORY_SIZE) newHistory.shift()
+    // Update the feature name to reflect current param values
+    const features = get().features.map((f) => {
+      if (f.id !== panel.feature.id) return f
+      return { ...panel.feature, name: generateFeatureName(panel.feature) }
+    })
+    set({
+      featurePanel: null,
+      features,
+      history: newHistory,
+      future: [],
+    })
+  },
+
+  cancelFeaturePanel: async () => {
+    const panel = get().featurePanel
+    if (!panel) return
+    // Revert to the snapshot
+    set({
+      featurePanel: null,
+      features: panel.snapshotFeatures,
+    })
+    await performRebuild(panel.snapshotFeatures, set)
+  },
+
+  // ─── Constraint value input ────────────────────────────
+  inputDialog: null,
+  openNumberInput: (label, defaultValue) => {
+    return new Promise<number | null>((resolve) => {
+      set({
+        inputDialog: {
+          type: 'number',
+          label,
+          defaultValue,
+          resolve,
+        },
+      })
+    })
+  },
+  closeInputDialog: () => set({ inputDialog: null }),
 
   // Scene objects (still used for rendering — populated by rebuild)
   sceneObjects: new Map(),

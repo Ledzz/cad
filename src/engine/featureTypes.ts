@@ -173,8 +173,8 @@ export function featureDisplayLabel(feature: Feature): string {
 }
 
 /**
- * Get the editable parameter names for a feature type.
- * Used by the edit dialog to know which fields to show.
+ * Get the editable parameter names for a feature type (numeric only).
+ * Used by the properties panel to display values.
  */
 export function getEditableParams(feature: Feature): Record<string, { label: string; value: number; min?: number; max?: number; step?: number }> {
   switch (feature.type) {
@@ -198,5 +198,125 @@ export function getEditableParams(feature: Feature): Record<string, { label: str
       return {}
     default:
       return {}
+  }
+}
+
+// ─── Typed Parameter Definitions ────────────────────────────
+
+export interface NumberParamDef {
+  type: 'number'
+  label: string
+  key: string
+  value: number
+  min?: number
+  max?: number
+}
+
+export interface SelectParamDef {
+  type: 'select'
+  label: string
+  key: string
+  value: string
+  options: { value: string; label: string }[]
+}
+
+export type ParamDef = NumberParamDef | SelectParamDef
+
+/**
+ * Get ALL editable parameters for a feature, including selects.
+ * Used by the unified FeaturePanel for both creation and editing.
+ */
+export function getFullEditableParams(feature: Feature): ParamDef[] {
+  switch (feature.type) {
+    case 'extrude':
+      return [
+        { type: 'number', key: 'distance', label: 'Distance', value: feature.distance, min: 0.01 },
+        { type: 'select', key: 'direction', label: 'Direction', value: feature.direction, options: [
+          { value: 'normal', label: 'Normal' },
+          { value: 'reverse', label: 'Reverse' },
+          { value: 'symmetric', label: 'Symmetric' },
+        ]},
+        { type: 'select', key: 'operation', label: 'Operation', value: feature.operation, options: [
+          { value: 'boss', label: 'Boss (Add)' },
+          { value: 'cut', label: 'Cut (Remove)' },
+        ]},
+      ]
+    case 'revolve':
+      return [
+        { type: 'select', key: 'axis', label: 'Axis', value: feature.axis, options: [
+          { value: 'X', label: 'X axis' },
+          { value: 'Y', label: 'Y axis' },
+          { value: 'Z', label: 'Z axis' },
+        ]},
+        { type: 'number', key: 'angle', label: 'Angle (°)', value: feature.angle, min: 1, max: 360 },
+      ]
+    case 'fillet':
+      return [
+        { type: 'number', key: 'radius', label: 'Radius', value: feature.radius, min: 0.01 },
+      ]
+    case 'chamfer':
+      return [
+        { type: 'number', key: 'distance', label: 'Distance', value: feature.distance, min: 0.01 },
+      ]
+    case 'sketch':
+      return []
+    default:
+      return []
+  }
+}
+
+// ─── Feature type (excluding sketch) for creation ───────────
+
+export type CreatableFeatureType = 'extrude' | 'revolve' | 'fillet' | 'chamfer'
+
+/**
+ * Create a feature with default values.
+ * Used when opening the feature panel in creation mode.
+ */
+export function createDefaultFeature(
+  type: CreatableFeatureType,
+  id: string,
+  options?: { sketchId?: string; operation?: ExtrudeOperation; edgeIndices?: number[] }
+): Feature {
+  switch (type) {
+    case 'extrude':
+      return {
+        id,
+        name: 'Extrude',
+        type: 'extrude',
+        suppressed: false,
+        sketchId: options?.sketchId ?? '',
+        distance: 5,
+        direction: 'normal',
+        operation: options?.operation ?? 'boss',
+      }
+    case 'revolve':
+      return {
+        id,
+        name: 'Revolve',
+        type: 'revolve',
+        suppressed: false,
+        sketchId: options?.sketchId ?? '',
+        axis: 'Y',
+        angle: 360,
+      }
+    case 'fillet':
+      return {
+        id,
+        name: 'Fillet',
+        type: 'fillet',
+        suppressed: false,
+        radius: 0.5,
+        edgeIndices: options?.edgeIndices,
+      }
+    case 'chamfer':
+      return {
+        id,
+        name: 'Chamfer',
+        type: 'chamfer',
+        suppressed: false,
+        distance: 0.5,
+        edgeIndices: options?.edgeIndices,
+      }
   }
 }

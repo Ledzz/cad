@@ -64,7 +64,7 @@ export function PropertiesPanel() {
   const selection = useAppStore((s) => s.selection)
   const sceneObjects = useAppStore((s) => s.sceneObjects)
   const features = useAppStore((s) => s.features)
-  const setEditingFeature = useAppStore((s) => s.setEditingFeature)
+  const openFeaturePanelEdit = useAppStore((s) => s.openFeaturePanelEdit)
   const selectedIds = selection.selectedIds
 
   return (
@@ -118,7 +118,7 @@ export function PropertiesPanel() {
                             <button
                               className="mt-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
                               onClick={() =>
-                                setEditingFeature({ featureId: feature.id })
+                                openFeaturePanelEdit(feature.id)
                               }
                             >
                               Edit...

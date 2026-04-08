@@ -3,7 +3,8 @@ import { Toolbar } from './components/Toolbar'
 import { FeatureTree } from './components/FeatureTree'
 import { Viewport } from './components/Viewport'
 import { PropertiesPanel } from './components/PropertiesPanel'
-import { FeatureEditDialog } from './components/FeatureEditDialog'
+import { FeaturePanel } from './components/FeaturePanel'
+import { InputDialog } from './components/InputDialog'
 import { useAppStore } from './store/appStore'
 import {
   getApplicableConstraints,
@@ -14,7 +15,7 @@ import type { SketchConstraint } from './engine/sketchTypes'
 import type { AppState } from './store/appStore'
 
 /** Try to apply a constraint to the current selection via keyboard shortcut */
-function applyConstraintShortcut(store: AppState, constraintType: SketchConstraint['type']) {
+async function applyConstraintShortcut(store: AppState, constraintType: SketchConstraint['type']) {
   const sketch = store.activeSketch
   if (!sketch) return
 
@@ -24,7 +25,7 @@ function applyConstraintShortcut(store: AppState, constraintType: SketchConstrai
   const applicable = getApplicableConstraints(selectedEntityIds, entities)
   if (!applicable.includes(constraintType)) return
 
-  // For dimensional constraints, prompt for value
+  // For dimensional constraints, use input dialog for value
   const needsValue = ['distance', 'horizontalDistance', 'verticalDistance', 'angle', 'radius'].includes(constraintType)
   let value: number | undefined
 
@@ -38,10 +39,9 @@ function applyConstraintShortcut(store: AppState, constraintType: SketchConstrai
     if (tempConstraint && 'value' in tempConstraint) {
       const label = constraintType === 'angle' ? 'Angle (degrees)' : 'Value'
       const defaultVal = Math.round((tempConstraint as any).value * 1000) / 1000
-      const input = prompt(`${label}:`, String(defaultVal))
-      if (input === null) return
-      value = parseFloat(input)
-      if (isNaN(value)) return
+      const result = await store.openNumberInput(label, defaultVal)
+      if (result === null) return
+      value = result
     }
   }
 
@@ -235,7 +235,8 @@ function App() {
         <Viewport />
         <PropertiesPanel />
       </div>
-      <FeatureEditDialog />
+      <FeaturePanel />
+      <InputDialog />
     </>
   )
 }
