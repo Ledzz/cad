@@ -228,11 +228,19 @@ export async function rebuildAll(
 
   const results = new Map<string, THREE.BufferGeometry>()
 
+  // Create a shallow working copy of features so that in-place updates
+  // (e.g. computed reference plane values) don't mutate the caller's
+  // objects.  This preserves Zustand's immutability contract and keeps
+  // undo/redo history snapshots intact.
+  const workingFeatures: Feature[] = features.map((f) =>
+    f.type === 'referencePlane' ? { ...f } : f
+  )
+
   // Track the ID of the most recently built solid so cut features know what to subtract from.
   // This is a simplified single-body model; multi-body would need a more sophisticated approach.
   let activeSolidId: string | undefined
 
-  for (const feature of features) {
+  for (const feature of workingFeatures) {
     if (feature.suppressed) continue
 
     try {
@@ -245,10 +253,9 @@ export async function rebuildAll(
         case 'referencePlane': {
           // Reference planes don't produce solid geometry.
           // Recompute the plane from the method parameters so downstream sketches use the right plane.
+          // We write into the working copy (not the original) so the store is never mutated.
           const refFeature = feature as ReferencePlaneFeature
-          const computed = computeReferencePlane(refFeature.method, features)
-          // Update the plane in place (mutates the feature for the current rebuild)
-          refFeature.plane = computed
+          refFeature.plane = computeReferencePlane(refFeature.method, workingFeatures)
           break
         }
         case 'extrude': {

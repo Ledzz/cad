@@ -12,9 +12,10 @@ import {
   generateEntityId,
 } from '../engine/sketchTypes'
 import type { Feature, SketchFeature } from '../engine/featureTypes'
-import { generateFeatureId, restoreSketchEntities, snapshotSketch } from '../engine/featureTypes'
+import { generateFeatureId, restoreSketchEntities, snapshotSketch, syncFeatureCounter } from '../engine/featureTypes'
 import { rebuildAll } from '../engine/rebuild'
 import { solveConstraints, getConstraintReferencedIds } from '../engine/constraintSolver'
+import { debounceAsync } from '../utils/debounce'
 
 // ─── Selection ──────────────────────────────────────────────
 
@@ -299,6 +300,15 @@ async function performRebuild(
   }
 }
 
+/**
+ * Debounced variant of `performRebuild` used for live-preview paths
+ * (e.g. slider drags in the feature panel).  The UI parameter update is
+ * applied immediately via `set()`, but the expensive WASM rebuild is
+ * delayed so that rapid successive changes are batched.
+ */
+const REBUILD_DEBOUNCE_MS = 120
+const debouncedPerformRebuild = debounceAsync(performRebuild, REBUILD_DEBOUNCE_MS)
+
 // ─── History helper ─────────────────────────────────────────
 
 /**
@@ -559,6 +569,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     const newHistory = [...history]
     const previous = newHistory.pop()!
+    syncFeatureCounter(previous)
     set({
       history: newHistory,
       future: [...get().future, features],
@@ -573,6 +584,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     const newFuture = [...future]
     const next = newFuture.pop()!
+    syncFeatureCounter(next)
     set({
       future: newFuture,
       history: [...get().history, features],
@@ -650,6 +662,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   loadProject: async (features) => {
+    // Sync ID counters so new features don't collide with loaded ones
+    syncFeatureCounter(features)
+    // Sync sketch counter — scan sketch feature IDs for the highest number
+    let maxSketch = 0
+    for (const f of features) {
+      if (f.type === 'sketch') {
+        const match = f.id.match(/-(\d+)$/)
+        if (match) {
+          const n = parseInt(match[1], 10)
+          if (n > maxSketch) maxSketch = n
+        }
+      }
+    }
+    sketchCounter = Math.max(sketchCounter, maxSketch)
+
     // Exit sketch mode if active, clear history, replace features
     set({
       mode: 'modeling',
@@ -741,12 +768,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       featurePanel: { ...panel, feature: updatedFeature },
       features,
     })
-    await performRebuild(features, set)
+    // Use the debounced rebuild for live-preview — the UI parameter is
+    // already updated above via set(), so the user sees immediate feedback
+    // while the expensive WASM rebuild is batched.
+    await debouncedPerformRebuild(features, set)
   },
 
   commitFeaturePanel: () => {
     const panel = get().featurePanel
     if (!panel) return
+    // Cancel any pending debounced rebuild — the commit snapshot is the final state
+    debouncedPerformRebuild.cancel()
     // Push the snapshot as undo history (so undo reverts to before the panel opened)
     const { history } = get()
     const newHistory = [...history, panel.snapshotFeatures]
@@ -767,6 +799,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   cancelFeaturePanel: async () => {
     const panel = get().featurePanel
     if (!panel) return
+    // Cancel any pending debounced rebuild before reverting
+    debouncedPerformRebuild.cancel()
     // Revert to the snapshot
     set({
       featurePanel: null,

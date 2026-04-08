@@ -4,6 +4,7 @@ import {
   restoreSketchEntities,
   generateFeatureId,
   resetFeatureCounter,
+  syncFeatureCounter,
   featureTypeLabel,
   featureDisplayLabel,
   getEditableParams,
@@ -294,5 +295,63 @@ describe('createDefaultFeature', () => {
     if (f.type === 'chamfer') {
       expect(f.distance).toBe(0.5)
     }
+  })
+})
+
+// ─── syncFeatureCounter ─────────────────────────────────────
+
+describe('syncFeatureCounter', () => {
+  beforeEach(() => {
+    resetFeatureCounter()
+  })
+
+  it('syncs counter to the highest numeric suffix across all features', () => {
+    const features = [
+      { id: 'sketch-1', name: 'Sketch 1', type: 'sketch' as const, suppressed: false, sketch: { plane: SKETCH_PLANES.XY, entities: [], constraints: [] } },
+      { id: 'extrude-5', name: 'Extrude', type: 'extrude' as const, suppressed: false, sketchId: 'sketch-1', distance: 10, direction: 'normal' as const, operation: 'boss' as const, mode: 'blind' as const },
+      { id: 'fillet-3', name: 'Fillet', type: 'fillet' as const, suppressed: false, radius: 2 },
+    ]
+    syncFeatureCounter(features as any)
+
+    // Next generated ID should be extrude-6 (counter at 5, increments to 6)
+    const next = generateFeatureId('extrude')
+    expect(next).toBe('extrude-6')
+  })
+
+  it('does nothing for empty features', () => {
+    syncFeatureCounter([])
+    const next = generateFeatureId('test')
+    expect(next).toBe('test-1')
+  })
+
+  it('handles features without numeric suffixes gracefully', () => {
+    const features = [
+      { id: 'custom-name', name: 'Custom', type: 'sketch' as const, suppressed: false, sketch: { plane: SKETCH_PLANES.XY, entities: [], constraints: [] } },
+    ]
+    syncFeatureCounter(features as any)
+    const next = generateFeatureId('test')
+    expect(next).toBe('test-1')
+  })
+
+  it('never decreases the counter', () => {
+    // Manually advance counter to 10
+    for (let i = 0; i < 10; i++) generateFeatureId('x')
+    // Now sync with features that have lower IDs
+    const features = [
+      { id: 'sketch-3', name: 'Sketch', type: 'sketch' as const, suppressed: false, sketch: { plane: SKETCH_PLANES.XY, entities: [], constraints: [] } },
+    ]
+    syncFeatureCounter(features as any)
+    const next = generateFeatureId('test')
+    // Counter was at 10, sync with max=3 should not decrease it → 11
+    expect(next).toBe('test-11')
+  })
+
+  it('works correctly after a sync followed by more generates', () => {
+    const features = [
+      { id: 'extrude-7', name: 'Extrude', type: 'extrude' as const, suppressed: false, sketchId: 'sketch-1', distance: 10, direction: 'normal' as const, operation: 'boss' as const, mode: 'blind' as const },
+    ]
+    syncFeatureCounter(features as any)
+    expect(generateFeatureId('a')).toBe('a-8')
+    expect(generateFeatureId('b')).toBe('b-9')
   })
 })

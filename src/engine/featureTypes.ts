@@ -149,6 +149,23 @@ export function resetFeatureCounter(): void {
 }
 
 /**
+ * Synchronise the feature counter with an existing set of features so that
+ * subsequent calls to `generateFeatureId` never collide with IDs already
+ * present.  Call this after loading a project file or restoring history.
+ */
+export function syncFeatureCounter(features: Feature[]): void {
+  let max = featureCounter
+  for (const f of features) {
+    const match = f.id.match(/-(\d+)$/)
+    if (match) {
+      const n = parseInt(match[1], 10)
+      if (n > max) max = n
+    }
+  }
+  featureCounter = max
+}
+
+/**
  * Create a SketchSnapshot from a live sketch's entity Map.
  */
 export function snapshotSketch(

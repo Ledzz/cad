@@ -46,7 +46,8 @@ export function loadProjectFile(file: File): Promise<Feature[]> {
   })
 }
 
-function validateProjectFile(data: unknown): Feature[] {
+/** @internal Exported for testing — validate and migrate a parsed project file object. */
+export function validateProjectFile(data: unknown): Feature[] {
   if (typeof data !== 'object' || data === null) {
     throw new Error('Invalid project file: not an object')
   }
