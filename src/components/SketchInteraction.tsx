@@ -5,7 +5,9 @@ import { useAppStore } from '../store/appStore'
 import type {
   SketchPoint,
   SketchEntity,
+  SnapTarget,
 } from '../engine/sketchTypes'
+import { inferConstraints } from '../engine/constraintInference'
 
 // ─── Constants ──────────────────────────────────────────────
 
@@ -29,16 +31,16 @@ function worldToSketch2D(
   }
 }
 
-/** Snap to existing points, grid, or axes */
+/** Snap to existing points, grid, or axes — returns a rich SnapTarget */
 function findSnap(
   pos: { x: number; y: number },
   entities: Map<string, SketchEntity>,
   snapDistance: number
-): { x: number; y: number; snapped: boolean } {
+): { x: number; y: number; snapped: boolean; snapTarget: SnapTarget } {
   // Check existing points for endpoint snap
   let closestDist = snapDistance
+  let bestTarget: SnapTarget = null
   let snappedPos = { ...pos }
-  let snapped = false
 
   for (const entity of entities.values()) {
     if (entity.type !== 'point') continue
@@ -48,19 +50,19 @@ function findSnap(
     if (dist < closestDist) {
       closestDist = dist
       snappedPos = { x: entity.x, y: entity.y }
-      snapped = true
+      bestTarget = { type: 'endpoint', pointId: entity.id, x: entity.x, y: entity.y }
     }
   }
 
-  if (snapped) return { ...snappedPos, snapped: true }
+  if (bestTarget) return { ...snappedPos, snapped: true, snapTarget: bestTarget }
 
   // Origin snap — snap to (0,0) if close enough
   const originDist = Math.sqrt(pos.x * pos.x + pos.y * pos.y)
   if (originDist < snapDistance) {
-    return { x: 0, y: 0, snapped: true }
+    return { x: 0, y: 0, snapped: true, snapTarget: { type: 'endpoint', pointId: '__origin__', x: 0, y: 0 } }
   }
 
-  return { ...pos, snapped: false }
+  return { ...pos, snapped: false, snapTarget: null }
 }
 
 /** Find the existing point at a position, or return null */
@@ -220,6 +222,7 @@ export function SketchInteraction() {
   const activeSketch = useAppStore((s) => s.activeSketch)
   const addSketchEntity = useAppStore((s) => s.addSketchEntity)
   const addSketchEntities = useAppStore((s) => s.addSketchEntities)
+  const addConstraints = useAppStore((s) => s.addConstraints)
   const setSketchPreviewPosition = useAppStore((s) => s.setSketchPreviewPosition)
   const addDrawingPoint = useAppStore((s) => s.addDrawingPoint)
   const resetDrawingState = useAppStore((s) => s.resetDrawingState)
@@ -271,6 +274,9 @@ export function SketchInteraction() {
     isDragging: boolean
   } | null>(null)
 
+  // Track the current snap target for rendering indicators
+  const snapTargetRef = useRef<SnapTarget>(null)
+
   // Build sketch plane geometry (for raycasting)
   const planeData = useMemo(() => {
     if (!activeSketch) return null
@@ -301,6 +307,7 @@ export function SketchInteraction() {
 
     // Apply snapping
     const snapped = findSnap(pos2d, activeSketch.entities, SNAP_DISTANCE)
+    snapTargetRef.current = snapped.snapTarget
     return { x: snapped.x, y: snapped.y }
   }, [planeData, activeSketch, raycaster, pointer, camera])
 
@@ -343,6 +350,25 @@ export function SketchInteraction() {
   )
 
   // ─── Tool Handlers ──────────────────────────────────────
+
+  /** Run auto-constraint inference on newly created entities */
+  const runInference = useCallback(
+    (newEntityIds: string[]) => {
+      if (newEntityIds.length === 0) return
+      const sketch = useAppStore.getState().activeSketch
+      if (!sketch) return
+      const inferred = inferConstraints(
+        newEntityIds,
+        sketch.entities,
+        sketch.constraints,
+        () => generateId('cst')
+      )
+      if (inferred.length > 0) {
+        addConstraints(inferred)
+      }
+    },
+    [generateId, addConstraints]
+  )
 
   const handleClick = useCallback((e: any) => {
     // If a drag-select just completed, suppress this click
@@ -405,6 +431,8 @@ export function SketchInteraction() {
             endPointId: pt.id,
             construction: false,
           })
+          // Auto-infer constraints on the new line
+          runInference([lineId])
           // Chain: the end point becomes the start of the next line
           resetDrawingState()
           addDrawingPoint(pt.id)
@@ -479,6 +507,8 @@ export function SketchInteraction() {
             endAngle,
             construction: false,
           })
+          // Auto-infer constraints (e.g. tangent to existing lines)
+          runInference([arcId, centerPt.id])
           resetDrawingState()
         }
         break
@@ -515,6 +545,12 @@ export function SketchInteraction() {
             { type: 'line', id: ln4Id, startPointId: pt4.id, endPointId: firstPt.id, construction: false },
           ])
 
+          // Auto-infer constraints: H/V on edges + equal on opposite pairs
+          runInference([
+            firstPt.id, pt2.id, pt3.id, pt4.id,
+            ln1Id, ln2Id, ln3Id, ln4Id,
+          ])
+
           resetDrawingState()
         }
         break
@@ -528,6 +564,7 @@ export function SketchInteraction() {
     addDrawingPoint,
     resetDrawingState,
     generateId,
+    runInference,
   ])
 
   const handlePointerMove = useCallback(() => {

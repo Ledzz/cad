@@ -229,6 +229,8 @@ export interface AppState {
 
   // ─── Constraints ────────────────────────────────────────
   addConstraint: (constraint: SketchConstraint) => void
+  /** Batch-add multiple constraints (e.g. auto-inferred) and run solver once */
+  addConstraints: (constraints: SketchConstraint[]) => void
   removeConstraints: (ids: string[]) => void
   updateConstraintValue: (id: string, value: number) => void
   setActiveConstraintTool: (tool: ConstraintTool) => void
@@ -1158,6 +1160,21 @@ export const useAppStore = create<AppState>((set, get) => ({
       },
     })
     // Run solver after adding constraint
+    get().runSolver()
+  },
+
+  addConstraints: (constraints) => {
+    if (constraints.length === 0) return
+    const sketch = get().activeSketch
+    if (!sketch) return
+    const newConstraints = [...sketch.constraints, ...constraints]
+    set({
+      activeSketch: {
+        ...sketch,
+        constraints: newConstraints,
+      },
+    })
+    // Run solver once for the whole batch
     get().runSolver()
   },
 

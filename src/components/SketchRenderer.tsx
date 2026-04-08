@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import * as THREE from 'three'
 import { Line, Text } from '@react-three/drei'
 import { useAppStore } from '../store/appStore'
+import { ANGLE_TOLERANCE_DEG } from '../engine/constraintInference'
 import type {
   SketchPoint,
   SketchLine,
@@ -28,6 +29,8 @@ const CIRCLE_SEGMENTS = 64
 
 const ORIGIN_COLOR = '#888888'
 const ORIGIN_LENGTH = 2 // units in each direction from origin
+
+const HINT_COLOR = '#88ddaa' // Muted green for auto-constraint hints
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -277,6 +280,107 @@ function DrawingPreview({
   }
 
   return null
+}
+
+// ─── Constraint Hint Indicator ──────────────────────────────
+
+const ANGLE_TOL_RAD = (ANGLE_TOLERANCE_DEG * Math.PI) / 180
+
+/**
+ * Shows a small text hint near the cursor during drawing to indicate what
+ * constraint will be automatically applied if the user clicks here.
+ * E.g., "H" for horizontal, "V" for vertical, "⊥" for perpendicular.
+ */
+function ConstraintHintIndicator({
+  to3D,
+}: {
+  to3D: (x: number, y: number) => THREE.Vector3
+}) {
+  const activeSketch = useAppStore((s) => s.activeSketch)
+
+  const hints = useMemo(() => {
+    if (!activeSketch) return []
+    const { drawingState, entities, activeTool } = activeSketch
+    const { placedPointIds, previewPosition } = drawingState
+    if (!previewPosition) return []
+
+    const labels: string[] = []
+
+    // Only compute hints for the line tool with one point placed (about to create a line)
+    if (activeTool === 'line' && placedPointIds.length === 1) {
+      const startPt = entities.get(placedPointIds[0]) as SketchPoint | undefined
+      if (!startPt) return []
+
+      const dx = previewPosition.x - startPt.x
+      const dy = previewPosition.y - startPt.y
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len < 0.01) return []
+
+      // Angle of the prospective line to X-axis [0, pi)
+      let angle = Math.atan2(dy, dx)
+      if (angle < 0) angle += Math.PI
+      if (angle >= Math.PI) angle -= Math.PI
+
+      const isH = angle < ANGLE_TOL_RAD || angle > Math.PI - ANGLE_TOL_RAD
+      const isV = Math.abs(angle - Math.PI / 2) < ANGLE_TOL_RAD
+
+      if (isH) labels.push('H')
+      if (isV) labels.push('V')
+
+      // Check perpendicular to existing connected lines (only if not H/V)
+      if (!isH && !isV) {
+        for (const entity of entities.values()) {
+          if (entity.type !== 'line') continue
+          const sharesEndpoint =
+            entity.startPointId === placedPointIds[0] ||
+            entity.endPointId === placedPointIds[0]
+          if (!sharesEndpoint) continue
+
+          const ep1 = entities.get(entity.startPointId) as SketchPoint | undefined
+          const ep2 = entities.get(entity.endPointId) as SketchPoint | undefined
+          if (!ep1 || !ep2) continue
+
+          let eAngle = Math.atan2(ep2.y - ep1.y, ep2.x - ep1.x)
+          if (eAngle < 0) eAngle += Math.PI
+          if (eAngle >= Math.PI) eAngle -= Math.PI
+
+          let diff = Math.abs(angle - eAngle)
+          if (diff > Math.PI / 2) diff = Math.PI - diff
+          if (Math.abs(diff - Math.PI / 2) < ANGLE_TOL_RAD) {
+            labels.push('⊥')
+            break // One perpendicular hint is enough
+          }
+        }
+      }
+    }
+
+    // Rectangle tool: always show "H V =" hint since rectangle always gets those
+    if (activeTool === 'rectangle' && placedPointIds.length === 1) {
+      labels.push('H', 'V', '=')
+    }
+
+    return labels
+  }, [activeSketch])
+
+  if (hints.length === 0) return null
+  if (!activeSketch?.drawingState.previewPosition) return null
+
+  const { previewPosition } = activeSketch.drawingState
+  const pos3D = to3D(previewPosition.x + 0.6, previewPosition.y + 0.6)
+  pos3D.add(new THREE.Vector3(0, 0, 0.15))
+
+  return (
+    <Text
+      position={pos3D}
+      fontSize={0.3}
+      color={HINT_COLOR}
+      anchorX="left"
+      anchorY="bottom"
+      depthOffset={-1}
+    >
+      {hints.join(' ')}
+    </Text>
+  )
 }
 
 // ─── Sketch Plane Visual ────────────────────────────────────
@@ -799,6 +903,7 @@ export function SketchRenderer() {
       })}
 
       <DrawingPreview to3D={transform.to3D} />
+      <ConstraintHintIndicator to3D={transform.to3D} />
       <ConstraintRenderer to3D={transform.to3D} />
       <SelectionRectangle to3D={transform.to3D} />
     </>
